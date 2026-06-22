@@ -34,6 +34,16 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   defaultDevice: ctx<string>('defaultDevice', 'iPhone 17'),
   artifactRetentionDays: Number(ctx<number>('artifactRetentionDays', 14)),
   presignTtlSec: Number(ctx<number>('presignTtlSec', 3600)),
+  // Optional VPC wiring — populate to reach private resources (Nexus, internal
+  // validation services). Empty = no VPC, fleet runs with public egress only.
+  vpcId: ctx<string>('vpcId', ''),
+  subnetIds: csv(ctx<string>('subnetIds', '')),
+  securityGroupIds: csv(ctx<string>('securityGroupIds', '')),
 });
+
+/** Parse a comma-separated context string into a trimmed, non-empty array. */
+function csv(v: string): string[] {
+  return v.split(',').map((s) => s.trim()).filter(Boolean);
+}
 
 app.synth();

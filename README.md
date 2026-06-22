@@ -222,6 +222,27 @@ by device id, runs `xcodebuild test`, uploads a screenshot and
 the xcresult into `builds/$CODEBUILD_BUILD_ID/summary.json` — the authoritative
 source for the structured `test_summary` / `failures` the tools return.
 
+### Connect builds to your private network (Nexus, internal services)
+
+By default the fleet has public egress only. To run builds inside your VPC — so
+they can pull from an internal Nexus/artifact repo and hit internal validation
+services during tests — set three optional context values at deploy time:
+
+```bash
+cdk deploy \
+  -c codebuild-ios-mcp:githubRepo=https://github.com/you/app \
+  -c codebuild-ios-mcp:projectDir=ios \
+  -c codebuild-ios-mcp:vpcId=vpc-0abc123 \
+  -c codebuild-ios-mcp:subnetIds=subnet-aaa,subnet-bbb \
+  -c codebuild-ios-mcp:securityGroupIds=sg-xyz
+```
+
+When set, the fleet attaches to the VPC and gets a fleet service role with the
+ENI permissions CodeBuild needs. Leave them empty for the default (no VPC). The
+subnets must route to your internal resources (NAT/Transit Gateway/peering as
+your topology requires); use VPC endpoints (PrivateLink) for private S3 and
+other AWS service access. Nothing else changes — the same four MCP tools work.
+
 ### The buildspec is the single source of truth
 
 `buildspec.yaml` at the repo root is read at synth time and embedded inline into

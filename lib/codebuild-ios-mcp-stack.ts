@@ -25,6 +25,16 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly artifactRetentionDays: number;
   /** TTL (seconds) for presigned artifact URLs returned by the Lambda. */
   readonly presignTtlSec: number;
+  /**
+   * Optional VPC wiring so builds can reach private resources (e.g. an internal
+   * Nexus repo at build time, internal validation services at test time). When
+   * vpcId + at least one subnet are provided, the fleet is attached to the VPC
+   * and given a fleet service role with the ENI permissions CodeBuild needs.
+   * Leave empty for the default (no VPC, public egress only).
+   */
+  readonly vpcId?: string;
+  readonly subnetIds?: string[];
+  readonly securityGroupIds?: string[];
 }
 
 /**
@@ -102,12 +112,65 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     // raw CloudFormation resource. ON_DEMAND overflow is NOT supported for
     // MAC_ARM, hence QUEUE.
     // ----------------------------------------------------------------------- //
+    // Optional VPC: attach the fleet to private subnets so builds reach internal
+    // resources (Nexus, internal validation services). Enabled only when a VPC id
+    // and at least one subnet are supplied. CodeBuild requires a fleet service
+    // role (trusts codebuild.amazonaws.com) with ENI permissions when in a VPC.
+    const subnetIds = props.subnetIds ?? [];
+    const vpcEnabled = Boolean(props.vpcId) && subnetIds.length > 0;
+
+    let fleetServiceRoleArn: string | undefined;
+    let fleetVpcConfig: codebuild.CfnFleet.VpcConfigProperty | undefined;
+    if (vpcEnabled) {
+      const fleetServiceRole = new iam.Role(this, 'FleetServiceRole', {
+        roleName: `${fleetName}-fleet-role`,
+        assumedBy: new iam.ServicePrincipal('codebuild.amazonaws.com'),
+        description: 'Fleet service role granting CodeBuild the ENI permissions to run builds inside the VPC.',
+      });
+      // Scoped to ENI lifecycle in the configured subnets; CreateNetworkInterfacePermission
+      // is guarded by the codebuild.amazonaws.com authorized service condition.
+      fleetServiceRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'VpcEni',
+          actions: [
+            'ec2:CreateNetworkInterface',
+            'ec2:DescribeNetworkInterfaces',
+            'ec2:DeleteNetworkInterface',
+            'ec2:DescribeSubnets',
+            'ec2:DescribeSecurityGroups',
+            'ec2:DescribeDhcpOptions',
+            'ec2:DescribeVpcs',
+          ],
+          resources: ['*'],
+        }),
+      );
+      fleetServiceRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'VpcEniPermission',
+          actions: ['ec2:CreateNetworkInterfacePermission'],
+          resources: [`arn:${this.partition}:ec2:${region}:${this.account}:network-interface/*`],
+          conditions: {
+            StringEquals: { 'ec2:AuthorizedService': 'codebuild.amazonaws.com' },
+          },
+        }),
+      );
+      fleetServiceRoleArn = fleetServiceRole.roleArn;
+      fleetVpcConfig = {
+        vpcId: props.vpcId,
+        subnets: subnetIds,
+        securityGroupIds: props.securityGroupIds ?? [],
+      };
+    }
+
     const fleet = new codebuild.CfnFleet(this, 'MacArmFleet', {
       name: fleetName,
       baseCapacity: 1,
       computeType: 'BUILD_GENERAL1_MEDIUM',
       environmentType: 'MAC_ARM',
       overflowBehavior: 'QUEUE',
+      // Only set when VPC is enabled; otherwise left undefined (no VPC).
+      fleetServiceRole: fleetServiceRoleArn,
+      fleetVpcConfig,
     });
 
     // ----------------------------------------------------------------------- //
@@ -301,6 +364,10 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'StackRegion', {
       value: region,
       description: 'Region the stack is deployed in (used by the helper scripts).',
+    });
+    new cdk.CfnOutput(this, 'FleetVpcStatus', {
+      value: vpcEnabled ? `${props.vpcId} (${subnetIds.length} subnet(s))` : 'none (public egress only)',
+      description: 'Whether the fleet is attached to a VPC for private resource access.',
     });
   }
 }
