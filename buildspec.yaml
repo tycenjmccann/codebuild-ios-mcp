@@ -1,0 +1,91 @@
+# Production buildspec for the iOS repo under test.
+# Runs on the MAC_ARM CodeBuild fleet. The MCP ios_test tool overrides
+# SCHEME / DEVICE / OS_VERSION / TEST_PLAN / PROJECT_DIR via
+# environmentVariablesOverride; ARTIFACTS_BUCKET is set on the project.
+#
+# Each CodeBuild command runs in its own shell with a fresh CWD, so the whole
+# run is ONE block to keep state (cd, vars) intact.
+version: 0.2
+
+env:
+  variables:
+    SCHEME: ""          # required (or auto-detected to the first shared scheme)
+    DEVICE: "iPhone 17" # simulator device name
+    OS_VERSION: "latest"
+    TEST_PLAN: ""
+    PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
+
+phases:
+  build:
+    commands:
+      - |
+        # No global `set -e`: scheme/device probing uses commands that return
+        # nonzero on "no match" (ls, grep), which would abort the run before
+        # xcodebuild ever ran. We capture the test exit code explicitly instead.
+        BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
+        BRANCH="${BRANCH##refs/heads/}"
+        cd "$CODEBUILD_SRC_DIR/$PROJECT_DIR" || { echo "PROJECT_DIR '$PROJECT_DIR' not found"; exit 1; }
+
+        # --- pick container: workspace beats project (globs may not match) ---
+        WS=""; PROJ=""
+        for f in *.xcworkspace; do [ -e "$f" ] && WS="$f" && break; done
+        for f in *.xcodeproj;   do [ -e "$f" ] && PROJ="$f" && break; done
+        if [ -n "$WS" ]; then CONTAINER=(-workspace "$WS"); else CONTAINER=(-project "$PROJ"); fi
+        echo "Container: ${CONTAINER[*]}"
+
+        # --- publish scheme manifest for the list_schemes tool ---
+        LIST_JSON=$(xcodebuild "${CONTAINER[@]}" -list -json 2>/dev/null || echo '{}')
+        echo "$LIST_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin) or {}; k='workspace' if 'workspace' in d else ('project' if 'project' in d else None); s=(d.get(k,{}).get('schemes') if k else []) or []; print(json.dumps({'schemes': s, 'default_scheme': s[0] if s else ''}))" > schemes.json
+        aws s3 cp schemes.json "s3://$ARTIFACTS_BUCKET/schemes/$BRANCH.json" || true
+        [ -z "$SCHEME" ] && SCHEME=$(python3 -c "import json;print(json.load(open('schemes.json'))['default_scheme'])")
+        echo "Using scheme: $SCHEME"
+
+        # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
+        DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+        if [ -z "$DEST_ID" ]; then
+          echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
+          DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+        fi
+        xcrun simctl boot "$DEST_ID" || true
+
+        # --- resolve deps, then test ---
+        xcodebuild "${CONTAINER[@]}" -resolvePackageDependencies -scheme "$SCHEME" || true
+        TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
+        set +e
+        xcodebuild test \
+          "${CONTAINER[@]}" \
+          -scheme "$SCHEME" \
+          -destination "id=$DEST_ID" \
+          -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
+          "${TESTPLAN_ARG[@]}" \
+          -enableCodeCoverage YES \
+          2>&1 | tee "$CODEBUILD_SRC_DIR/build_output.log"
+        TEST_RC=${PIPESTATUS[0]}
+        set -e
+
+        # --- artifacts: screenshot + xcresult zip to S3 ---
+        cd "$CODEBUILD_SRC_DIR"
+        xcrun simctl io "$DEST_ID" screenshot screenshot_final.png || true
+        aws s3 cp screenshot_final.png "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
+        ditto -c -k --sequesterRsrc --keepParent TestResults.xcresult TestResults.xcresult.zip || true
+        aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
+
+        # --- parse results: summary.json (authoritative, read by the Lambda) + JUnit (console) ---
+        aws s3 cp "s3://$ARTIFACTS_BUCKET/tooling/xcresult_to_junit.py" /tmp/conv.py
+        python3 /tmp/conv.py TestResults.xcresult "$CODEBUILD_SRC_DIR/test_results.xml" "$CODEBUILD_SRC_DIR/summary.json" || true
+        # summary.json is the contract with ios_build_status — upload even on failure.
+        aws s3 cp "$CODEBUILD_SRC_DIR/summary.json" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/summary.json" || true
+        echo "=== summary.json ==="; cat "$CODEBUILD_SRC_DIR/summary.json" || true
+        exit $TEST_RC
+
+reports:
+  ios-test-report:
+    files:
+      - "test_results.xml"
+    file-format: "JUNITXML"
+
+artifacts:
+  files:
+    - "build_output.log"
+    - "screenshot_final.png"
+  base-directory: "."

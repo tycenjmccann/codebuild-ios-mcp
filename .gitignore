@@ -1,0 +1,30 @@
+# CDK
+cdk.out/
+.cdk.staging/
+cdk.context.json
+
+# Node
+node_modules/
+npm-debug.log
+yarn.lock
+# package-lock.json IS committed for reproducible installs
+
+# Compiled TypeScript output (sources are authoritative)
+bin/*.js
+bin/*.d.ts
+lib/*.js
+lib/*.d.ts
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local / editor
+.DS_Store
+.env
+*.local
+
+# Build scratch
+/tmp/

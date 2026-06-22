@@ -1,0 +1,51 @@
+[
+  {
+    "name": "ios_test",
+    "description": "Start an iOS build + test run on the CodeBuild macOS fleet for a given branch and scheme. Returns immediately with a build_id and status IN_PROGRESS. Poll ios_build_status with the build_id until the status is no longer IN_PROGRESS.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "branch": { "type": "string", "description": "Git branch or commit SHA to test" },
+        "scheme": { "type": "string", "description": "Xcode scheme to build and test" },
+        "device": { "type": "string", "description": "Simulator device name (e.g. 'iPhone 16')" },
+        "os_version": { "type": "string", "description": "iOS version (e.g. '18.2' or 'latest')" },
+        "test_plan": { "type": "string", "description": "Optional test plan name (empty = default)" }
+      },
+      "required": ["branch", "scheme"]
+    }
+  },
+  {
+    "name": "ios_build_status",
+    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with a test summary, per-test failures, and presigned artifact URLs (xcresult zip, screenshots, logs link).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "build_id": { "type": "string", "description": "CodeBuild build id returned by ios_test" }
+      },
+      "required": ["build_id"]
+    }
+  },
+  {
+    "name": "list_schemes",
+    "description": "List the Xcode schemes available on a branch, plus the default scheme. Reads the scheme manifest the buildspec publishes on each run; if none exists yet for the branch, returns empty.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "branch": { "type": "string", "description": "Branch name (default 'main')" }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "get_test_logs",
+    "description": "Get detailed output, class name, duration, and failure screenshots for a single failed test in a completed build. Use this after ios_build_status reports failures to understand why a specific test failed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "build_id": { "type": "string", "description": "CodeBuild build id" },
+        "test_name": { "type": "string", "description": "Name of the failed test (from failures[].test_name)" }
+      },
+      "required": ["build_id", "test_name"]
+    }
+  }
+]
