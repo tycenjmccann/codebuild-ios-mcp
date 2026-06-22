@@ -54,6 +54,15 @@ VPC (internal Nexus / validation services): add
 Endpoints (S3+Logs+CodeBuild) are auto-created for no-NAT subnets; add
 `-c codebuild-ios-mcp:createVpcEndpoints=false` if the VPC already has a NAT.
 
+## Connecting a consuming agent
+
+Gateway auth is `AWS_IAM` → requests must be SigV4-signed. Use the ready client
+`examples/connect_agent.py` (`python examples/connect_agent.py --list` proves
+auth + tool discovery). For an **AgentCore Runtime** agent, no secrets: it signs
+with its execution role's ambient creds. Just grant that role
+`bedrock-agentcore:InvokeGateway` on the gateway ARN, then point it at
+`GATEWAY_URL`.
+
 ## Verify
 
 ```bash

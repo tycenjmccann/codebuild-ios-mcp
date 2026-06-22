@@ -191,21 +191,32 @@ Cognito, no client secret. The `GATEWAY_URL` is printed by
 `scripts/register-gateway.sh` (re-print anytime with
 `aws bedrock-agentcore-control get-gateway --gateway-identifier <id>`).
 
-Strands agent (Python) — the four tools auto-discover through the Gateway:
+A complete, copy-paste client is in
+[`examples/connect_agent.py`](./examples/connect_agent.py) — a SigV4 httpx auth
+class wired into the MCP streamable-HTTP transport and handed to a Strands Agent.
 
-```python
-from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
-from botocore.auth import SigV4Auth          # SigV4-sign each MCP request
-# ... attach SigV4 to the streamable-http transport for service "bedrock-agentcore"
-
-GATEWAY_URL = "https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp"
-mcp = MCPClient(lambda: streamablehttp_client(GATEWAY_URL, auth=sigv4_for(GATEWAY_URL)))
-with mcp:
-    agent = Agent(tools=mcp.list_tools_sync())
-    agent("Run the MyApp tests on branch feature/x and tell me what failed.")
+```bash
+export GATEWAY_URL="https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp"
+python examples/connect_agent.py --list   # auth + tool-discovery smoke test (no model needed)
+python examples/connect_agent.py          # run an agent that drives a test build
 ```
+
+### AgentCore Runtime agents (the intended consumer)
+
+Nothing extra to wire. The runtime already executes under an IAM **execution
+role**, and botocore signs requests with those ambient credentials — no Cognito,
+no token vault, no client secret. Two requirements:
+
+1. Grant the runtime's execution role permission to invoke the gateway:
+
+   ```json
+   { "Effect": "Allow",
+     "Action": "bedrock-agentcore:InvokeGateway",
+     "Resource": "<GatewayArn from register-gateway.sh>" }
+   ```
+
+2. Point the agent at `GATEWAY_URL` using the transport in
+   `examples/connect_agent.py`. The four tools auto-discover via `tools/list`.
 
 For interactive testing, point the
 [MCP Inspector](https://modelcontextprotocol.io/) at `GATEWAY_URL` with a SigV4
@@ -313,6 +324,7 @@ aws codebuild delete-fleet --arn <FleetArn-from-outputs>
 ├── tooling/xcresult_to_junit.py     xcresult -> JUnit converter, uploaded to s3://<bucket>/tooling/
 ├── buildspec.yaml                   embedded inline into the CodeBuild project (single source of truth)
 ├── gateway-tools.json               inline tool schema for the Gateway lambda target
+├── examples/connect_agent.py        SigV4 MCP client — connect an agent to the gateway
 ├── scripts/register-gateway.sh      one-time: create gateway + lambda target from stack outputs
 ├── scripts/deregister-gateway.sh    delete target(s) + gateway
 ├── cdk.json                         CDK app config + context defaults
