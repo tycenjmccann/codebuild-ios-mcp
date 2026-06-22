@@ -31,6 +31,8 @@
     "//vpc": "OPTIONAL — set these to run builds inside your VPC (reach private Nexus, internal validation services). Leave empty for no VPC. subnetIds/securityGroupIds are comma-separated.",
     "codebuild-ios-mcp:vpcId": "",
     "codebuild-ios-mcp:subnetIds": "",
-    "codebuild-ios-mcp:securityGroupIds": ""
+    "codebuild-ios-mcp:securityGroupIds": "",
+    "//createVpcEndpoints": "When VPC mode is on, also create S3 + CloudWatch Logs + CodeBuild VPC endpoints so a private no-NAT subnet works. Set false if your VPC already has a NAT gateway.",
+    "codebuild-ios-mcp:createVpcEndpoints": true
   }
 }

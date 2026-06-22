@@ -238,10 +238,24 @@ cdk deploy \
 ```
 
 When set, the fleet attaches to the VPC and gets a fleet service role with the
-ENI permissions CodeBuild needs. Leave them empty for the default (no VPC). The
-subnets must route to your internal resources (NAT/Transit Gateway/peering as
-your topology requires); use VPC endpoints (PrivateLink) for private S3 and
-other AWS service access. Nothing else changes — the same four MCP tools work.
+ENI permissions CodeBuild needs. Leave them empty for the default (no VPC).
+
+**Private (no-NAT) subnets are supported out of the box.** A build inside a VPC
+can reach your private hosts but, without a path to AWS, loses CloudWatch log
+streaming and S3 artifact upload. So when VPC mode is on, the stack also creates
+the three endpoints a private subnet needs — an **S3 gateway endpoint** plus
+**CloudWatch Logs** and **CodeBuild** interface endpoints (PrivateLink) — with a
+security group that allows HTTPS from your build SGs. No NAT gateway required.
+
+If your VPC already has a NAT gateway (or those endpoints), skip them:
+
+```bash
+cdk deploy ... -c codebuild-ios-mcp:createVpcEndpoints=false
+```
+
+The subnets still must route to your internal resources (Nexus, validation
+services) via your own NAT/Transit Gateway/peering. Nothing else changes — the
+same four MCP tools work whether or not the fleet is in a VPC.
 
 ### The buildspec is the single source of truth
 

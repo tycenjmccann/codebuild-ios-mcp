@@ -39,11 +39,22 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   vpcId: ctx<string>('vpcId', ''),
   subnetIds: csv(ctx<string>('subnetIds', '')),
   securityGroupIds: csv(ctx<string>('securityGroupIds', '')),
+  // Default true: when VPC mode is on, also create S3/Logs/CodeBuild endpoints so
+  // a private no-NAT subnet works out of the box. Set false if you have a NAT.
+  createVpcEndpoints: bool(ctx<unknown>('createVpcEndpoints', true), true),
 });
 
 /** Parse a comma-separated context string into a trimmed, non-empty array. */
 function csv(v: string): string[] {
   return v.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Coerce a context value to boolean. CLI `-c k=false` arrives as the string
+ *  "false", which is truthy — treat "false"/"0"/"no" as false. */
+function bool(v: unknown, fallback: boolean): boolean {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') return !['false', '0', 'no', ''].includes(v.toLowerCase());
+  return fallback;
 }
 
 app.synth();

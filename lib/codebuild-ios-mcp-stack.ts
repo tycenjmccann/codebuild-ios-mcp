@@ -5,6 +5,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import {
   aws_codebuild as codebuild,
+  aws_ec2 as ec2,
   aws_iam as iam,
   aws_lambda as lambda,
   aws_logs as logs,
@@ -35,6 +36,14 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly vpcId?: string;
   readonly subnetIds?: string[];
   readonly securityGroupIds?: string[];
+  /**
+   * When VPC mode is on, also create the VPC endpoints a private (no-NAT) subnet
+   * needs so builds can still reach AWS: an S3 gateway endpoint (artifact upload)
+   * plus CloudWatch Logs and CodeBuild interface endpoints (log streaming + API).
+   * Set false if your VPC already has a NAT gateway or these endpoints. Ignored
+   * when VPC mode is off. Default true.
+   */
+  readonly createVpcEndpoints?: boolean;
 }
 
 /**
@@ -160,6 +169,50 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         subnets: subnetIds,
         securityGroupIds: props.securityGroupIds ?? [],
       };
+
+      // VPC endpoints so a private (no-NAT) subnet can still reach AWS: S3
+      // gateway (artifact upload) + CloudWatch Logs and CodeBuild interface
+      // endpoints (log streaming + control-plane). Without these, a VPC build
+      // reaches private hosts but loses access to AWS services. Built from raw
+      // ids via L1 resources to avoid Vpc.fromVpcAttributes' AZ/subnet-count
+      // constraint (we only have ids, not a full VPC model).
+      if (props.createVpcEndpoints !== false) {
+        // Interface-endpoint SG: HTTPS in from the build SGs, all out.
+        const endpointSg = new ec2.CfnSecurityGroup(this, 'VpcEndpointSg', {
+          vpcId: props.vpcId!,
+          groupDescription: 'HTTPS from the CodeBuild fleet to interface VPC endpoints.',
+          securityGroupIngress: (props.securityGroupIds ?? []).map((sgId) => ({
+            ipProtocol: 'tcp',
+            fromPort: 443,
+            toPort: 443,
+            sourceSecurityGroupId: sgId,
+            description: 'HTTPS from CodeBuild build security group',
+          })),
+        });
+
+        // S3 gateway endpoint (free; needs a route table — left to the operator's
+        // private route table, association added out-of-band if not default).
+        new ec2.CfnVPCEndpoint(this, 'S3GatewayEndpoint', {
+          vpcId: props.vpcId!,
+          serviceName: `com.amazonaws.${region}.s3`,
+          vpcEndpointType: 'Gateway',
+        });
+
+        // Interface endpoints for CloudWatch Logs + CodeBuild.
+        for (const [id, svc] of [
+          ['LogsEndpoint', 'logs'],
+          ['CodeBuildEndpoint', 'codebuild'],
+        ] as const) {
+          new ec2.CfnVPCEndpoint(this, id, {
+            vpcId: props.vpcId!,
+            serviceName: `com.amazonaws.${region}.${svc}`,
+            vpcEndpointType: 'Interface',
+            subnetIds,
+            securityGroupIds: [endpointSg.attrGroupId],
+            privateDnsEnabled: true,
+          });
+        }
+      }
     }
 
     const fleet = new codebuild.CfnFleet(this, 'MacArmFleet', {
