@@ -125,6 +125,13 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:defaultDevice`        | `iPhone 17`                                                     | Default simulator device name                      |
 | `codebuild-ios-mcp:artifactRetentionDays`| `14`                                                           | Days before `builds/` artifacts expire             |
 | `codebuild-ios-mcp:presignTtlSec`        | `3600`                                                         | TTL (seconds) for presigned artifact URLs          |
+| `codebuild-ios-mcp:vpcId`                | `""` (no VPC)                                                  | VPC to run builds in (reach private Nexus/services) |
+| `codebuild-ios-mcp:subnetIds`            | `""`                                                          | Comma-separated subnet ids for the fleet            |
+| `codebuild-ios-mcp:securityGroupIds`     | `""`                                                          | Comma-separated security group ids for the fleet    |
+| `codebuild-ios-mcp:createVpcEndpoints`   | `true`                                                        | When in a VPC, auto-create S3/Logs/CodeBuild endpoints (set `false` if you have a NAT) |
+
+See [Connect builds to your private network](#connect-builds-to-your-private-network-nexus-internal-services)
+for the VPC keys.
 
 ---
 
@@ -310,6 +317,7 @@ aws codebuild delete-fleet --arn <FleetArn-from-outputs>
 ├── scripts/deregister-gateway.sh    delete target(s) + gateway
 ├── cdk.json                         CDK app config + context defaults
 ├── package.json / tsconfig.json     project + TypeScript config
+├── AGENTS.md                        terse operational runbook for AI coding agents
 └── LICENSE                          MIT
 ```
 
