@@ -45,6 +45,7 @@
   .tool{font-size:12.5px;line-height:1.4}
   .tool b{display:block;font-family:var(--mono);font-size:12px;color:#1d6291}
   .tool span{color:var(--muted)}
+  .tool span code{font-family:var(--mono);font-size:11px;color:var(--ink)}
 
   .cost{margin-top:14px;padding:12px 13px;border:1px solid #f0d9a8;border-radius:9px;
     background:#fffaf0;font-size:12.5px;line-height:1.5;color:#7a5a16}
@@ -53,57 +54,56 @@
 </head>
 <body>
 <div class="wrap">
-  <h1><span class="m">codebuild-ios-mcp</span> — AWS Architecture</h1>
-  <p class="sub">Agent-driven iOS build &amp; test on AWS CodeBuild macOS, exposed as four MCP tools through a
-     Bedrock AgentCore Gateway. Solid = required core; dashed purple = optional add-ons.</p>
+  <h1><span class="m">codebuild-ios-mcp</span> · AWS Architecture</h1>
+  <p class="sub">AI agents build and test iOS apps on AWS CodeBuild macOS through four MCP tools, exposed via a
+     Bedrock AgentCore Gateway.</p>
 
   <div class="layout">
     <!-- ============ LEFT: description ============ -->
     <aside class="side">
       <div class="key">
-        <div class="r"><svg viewBox="0 0 34 10"><path d="M0,5 H30" stroke="#ec7211" stroke-width="2.4"/><path d="M28,2 L34,5 L28,8 z" fill="#ec7211"/></svg><span><b>Required</b> — core path (incl. code + artifacts)</span></div>
-        <div class="r"><svg viewBox="0 0 34 10"><path d="M0,5 H30" stroke="#8c4fff" stroke-width="2" stroke-dasharray="5 3"/><path d="M28,2 L34,5 L28,8 z" fill="#8c4fff"/></svg><span><b style="color:#7a48cc">Optional</b> — VPC, endpoints, internal network</span></div>
+        <div class="r"><svg viewBox="0 0 34 10"><path d="M0,5 H30" stroke="#ec7211" stroke-width="2.4"/><path d="M28,2 L34,5 L28,8 z" fill="#ec7211"/></svg><span><b>Required</b> core path (code + artifacts)</span></div>
+        <div class="r"><svg viewBox="0 0 34 10"><path d="M0,5 H30" stroke="#8c4fff" stroke-width="2" stroke-dasharray="5 3"/><path d="M28,2 L34,5 L28,8 z" fill="#8c4fff"/></svg><span><b style="color:#7a48cc">Optional</b> VPC, endpoints, internal network</span></div>
       </div>
 
       <div class="grp req">How it works</div>
       <div class="sec req">
-        <div class="h"><span class="n">1</span> The agent asks to run tests</div>
-        <ul>
-          <li>Your AI agent calls a tool on the gateway — the gateway is the single secure door in (signed with the agent's AWS identity).</li>
-        </ul>
+        <div class="h"><span class="n">1</span> Agent requests a test run</div>
+        <ul><li>The agent calls <code>ios_test</code> through the <b>AgentCore Gateway</b>, passing the <b>branch</b> + <b>scheme</b>, and gets a <code>build_id</code> back right away.</li></ul>
       </div>
       <div class="sec req">
-        <div class="h"><span class="n">2</span> The gateway hands off to the backend</div>
-        <ul><li>It forwards the call to a small function that knows how to drive the build system.</li></ul>
+        <div class="h"><span class="n">2</span> Gateway forwards to the backend</div>
+        <ul><li>The gateway, the one <b>AWS_IAM</b>-signed door in, hands the call to the <b>Lambda</b> backend.</li></ul>
       </div>
       <div class="sec req">
-        <div class="h"><span class="n">3</span> A real Mac builds &amp; tests the app</div>
-        <ul>
-          <li>A macOS machine pulls your code from GitHub, compiles it, and runs the iOS tests on a simulator.</li>
-          <li>Results, screenshots, and logs are saved to storage; the agent checks back until the run finishes — pass or fail.</li>
-        </ul>
+        <div class="h"><span class="n">3</span> Lambda starts the build</div>
+        <ul><li>Lambda calls CodeBuild <code>StartBuild</code> on the <b>macOS fleet</b>.</li></ul>
+      </div>
+      <div class="sec req">
+        <div class="h"><span class="n">4</span> The Mac builds &amp; tests</div>
+        <ul><li>The fleet clones your code from <b>GitHub</b>, runs the iOS tests on a simulator, and writes results + artifacts to <b>S3</b>.</li></ul>
+      </div>
+      <div class="sec req">
+        <div class="h"><span class="n">5</span> Agent polls for results</div>
+        <ul><li>The agent polls <code>ios_build_status</code> with the <code>build_id</code> until the run finishes, then reads back <b>pass/fail, failing tests, and artifact links</b>.</li></ul>
       </div>
 
-      <div class="grp opt">Optional add-ons</div>
+      <div class="grp opt">Add-ons (optional)</div>
       <div class="sec opt">
-        <div class="h"><span class="n">4</span> Reach private company systems <span class="tag">VPC</span></div>
-        <ul>
-          <li>Run builds inside your network so they can use an internal package server (Nexus) and private test services — no public internet needed.</li>
-        </ul>
+        <div class="h"><span class="n">A</span> Reach private company systems <span class="tag">VPC</span></div>
+        <ul><li>Run builds inside your <b>VPC</b> so they reach an internal package server (<b>Nexus</b>) and private test services, with no public internet needed.</li></ul>
       </div>
       <div class="sec opt">
-        <div class="h"><span class="n">5</span> Make it faster &amp; multi-app <span class="tag">tune</span></div>
-        <ul>
-          <li>Reuse build caches so re-tests finish in seconds, and serve many apps from one shared build machine.</li>
-        </ul>
+        <div class="h"><span class="n">B</span> Faster re-tests &amp; many apps <span class="tag">tune</span></div>
+        <ul><li>Reuse a <b>build cache</b> so re-tests finish in seconds, and serve many apps from <b>one shared fleet</b>.</li></ul>
       </div>
 
       <div class="grp req" style="color:#1d6291">The MCP tools the agent gets</div>
       <div class="tools">
-        <div class="tool"><b>ios_test</b><span>Kick off a build &amp; test run for a branch + scheme. Returns right away with a build id.</span></div>
-        <div class="tool"><b>ios_build_status</b><span>Check a run by its id — returns pass/fail counts, the failing tests, and links to artifacts.</span></div>
-        <div class="tool"><b>list_schemes</b><span>List the app's build schemes so the agent picks the right one.</span></div>
-        <div class="tool"><b>get_test_logs</b><span>Pull the detailed log + screenshot for a single failing test.</span></div>
+        <div class="tool"><b>ios_test</b><span>Start a build &amp; test run for a branch and scheme; returns a <code>build_id</code> to track it.</span></div>
+        <div class="tool"><b>ios_build_status</b><span>Get a run's status and results by <code>build_id</code>: pass/fail counts, failing tests, and artifact links.</span></div>
+        <div class="tool"><b>list_schemes</b><span>List the schemes available on a branch so the agent can pick the right one.</span></div>
+        <div class="tool"><b>get_test_logs</b><span>Get the detailed log and screenshot for a single failing test.</span></div>
       </div>
 
       <div class="cost"><b>⚠ Cost:</b> the macOS build machine bills continuously while it exists (~$25–30/day, ~24 h minimum). Tear it down when idle.</div>
@@ -119,6 +119,8 @@
           <path d="M9,0 L0,5 L9,10 z" fill="#ec7211"/></marker>
         <marker id="ar--data" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
           <path d="M0,0 L9,5 L0,10 z" fill="#ec7211"/></marker>
+        <marker id="ar--dataR" markerWidth="10" markerHeight="10" refX="1.5" refY="5" orient="auto">
+          <path d="M9,0 L0,5 L9,10 z" fill="#ec7211"/></marker>
         <marker id="ar--opt" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
           <path d="M0,0 L9,5 L0,10 z" fill="#8c4fff"/></marker>
         <style>
@@ -178,28 +180,31 @@
       <text class="ilab2" x="781" y="931" text-anchor="middle">test-time: private APIs &amp; tools</text>
 
       <!-- ===================== FLOW ARROWS ===================== -->
-      <!-- 1 agent <-> gateway -->
-      <path class="flow" d="M178,177 H272" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
-      <circle cx="225" cy="177" r="10" fill="#ec7211"/><text class="num" x="225" y="181" text-anchor="middle">1</text>
+      <!-- agent <-> gateway : 1 = outbound request (top), 5 = polled result (return, below) -->
+      <path class="flow" d="M178,170 H272" marker-end="url(#ar--flow)"/>
+      <circle cx="225" cy="170" r="10" fill="#ec7211"/><text class="num" x="225" y="174" text-anchor="middle">1</text>
+      <path class="flow" d="M272,192 H178" marker-end="url(#ar--flow)"/>
+      <circle cx="225" cy="192" r="10" fill="#ec7211"/><text class="num" x="225" y="196" text-anchor="middle">5</text>
       <!-- 2 gateway <-> lambda -->
       <path class="flow" d="M338,177 H448" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="393" cy="177" r="10" fill="#ec7211"/><text class="num" x="393" y="181" text-anchor="middle">2</text>
       <!-- 3 lambda <-> codebuild : one elbow; circle sits on the vertical leg -->
       <path class="flow" d="M479,206 V250 H453 V378" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="453" cy="332" r="10" fill="#ec7211"/><text class="num" x="453" y="336" text-anchor="middle">3</text>
-      <!-- lambda <-> s3 (data) : clean top lane, S3 top-right outside the VPC -->
-      <path class="data" d="M508,177 H846" marker-start="url(#ar--data)" marker-end="url(#ar--data)"/>
-      <!-- codebuild -> fleet : starts below the CodeBuild label, lands on fleet top -->
+      <!-- lambda <-> s3 (data) : write on the way out, read back on poll -->
+      <path class="data" d="M508,177 H846" marker-start="url(#ar--dataR)" marker-end="url(#ar--data)"/>
+      <!-- 4 codebuild -> fleet : starts below the CodeBuild label, lands on fleet top -->
       <path class="flow" d="M453,468 V550" marker-end="url(#ar--flow)"/>
+      <circle cx="453" cy="509" r="10" fill="#ec7211"/><text class="num" x="453" y="513" text-anchor="middle">4</text>
       <!-- codebuild -> endpoints (OPTIONAL) : from icon right edge -->
       <path class="opt" d="M482,405 H718" marker-end="url(#ar--opt)"/>
       <!-- fleet -> endpoints (OPTIONAL) : from icon right edge -->
       <path class="opt" d="M482,581 H718" marker-end="url(#ar--opt)"/>
       <!-- s3 gateway endpoint -> regional S3 (OPTIONAL egress, up-and-over to the bucket) -->
       <path class="opt" d="M743,384 V250 H877 V212" marker-end="url(#ar--opt)"/>
-      <!-- 4 fleet -> corporate (OPTIONAL private path) : straight down -->
+      <!-- fleet -> corporate (OPTIONAL private path, add-on A) : straight down, unnumbered -->
       <path class="opt" d="M453,638 V812" marker-end="url(#ar--opt)"/>
-      <circle cx="453" cy="770" r="10" fill="#8c4fff"/><text class="num" x="453" y="774" text-anchor="middle">4</text>
+      <circle cx="453" cy="770" r="10" fill="#8c4fff"/><text class="num" x="453" y="774" text-anchor="middle">A</text>
       <!-- github -> codebuild (git clone) : straight up from icon, single elbow, straight over to icon left edge -->
       <path class="data" d="M145,838 V409 H422" marker-end="url(#ar--data)"/>
 
