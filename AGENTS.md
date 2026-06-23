@@ -64,9 +64,10 @@ else tool calls AccessDenied. Tear down just the target with
 Private repo: `aws codebuild import-source-credentials --server-type GITHUB
 --auth-type PERSONAL_ACCESS_TOKEN --token <pat>` once per account/region first.
 
-Cache (tighten fix→retest loop): add `-c codebuild-ios-mcp:cacheMode=local`
-(warm DerivedData on the reserved Mac; best for one shared project + many apps)
-or `=s3` (durable per-app cache; best for one-project-per-app). Default `none`.
+Cache (fix→retest loop): default `cacheMode=local` (warm DerivedData on the
+reserved Mac — builds are incremental out of the box). `=s3` for durable per-app
+cache (best one-project-per-app); `=none` for always-clean validation. Per-call
+`clean_build: true` on `ios_test` forces a cold run without touching the cache.
 
 Many apps: ALWAYS one shared fleet (only cost) — never one fleet per app. Either
 one shared project (agent passes `repo` + `project_dir` to `ios_test` per call)

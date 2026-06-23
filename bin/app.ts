@@ -43,7 +43,10 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   // a private no-NAT subnet works out of the box. Set false if you have a NAT.
   createVpcEndpoints: bool(ctx<unknown>('createVpcEndpoints', true), true),
   // Build cache to speed the fix->retest loop: 'none' | 'local' | 's3'.
-  cacheMode: cacheMode(ctx<string>('cacheMode', 'none')),
+  // Default 'local': warm DerivedData on the reserved Mac so re-tests are
+  // incremental. First build is still cold; per-call clean_build forces a cold
+  // run when needed. Set 'none' only for always-clean validation.
+  cacheMode: cacheMode(ctx<string>('cacheMode', 'local')),
 });
 
 /** Validate the cacheMode context value, falling back to 'none'. */

@@ -105,7 +105,7 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:subnetIds`            | `""`                                                          | Comma-separated subnet ids for the fleet            |
 | `codebuild-ios-mcp:securityGroupIds`     | `""`                                                          | Comma-separated security group ids for the fleet    |
 | `codebuild-ios-mcp:createVpcEndpoints`   | `true`                                                        | When in a VPC, auto-create S3/Logs/CodeBuild endpoints (set `false` if you have a NAT) |
-| `codebuild-ios-mcp:cacheMode`            | `none`                                                        | Build cache: `none` / `local` / `s3` — speeds the fix→retest loop |
+| `codebuild-ios-mcp:cacheMode`            | `local`                                                       | Build cache: `local` / `none` / `s3` — `local` keeps the fix→retest loop fast (default) |
 
 See [Connect builds to your private network](#connect-builds-to-your-private-network-nexus-internal-services)
 for the VPC keys.
@@ -157,8 +157,10 @@ KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregiste
 The Gateway exposes the six tools defined in `gateway-tools.json`. The contract
 is async — start a build, then poll:
 
-1. `ios_test(branch, scheme, [device], [os_version], [test_plan])`
-   → returns `{ status: "IN_PROGRESS", build_id }` immediately.
+1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build])`
+   → returns `{ status: "IN_PROGRESS", build_id }` immediately. `repo`/`project_dir`
+   point the shared project at another app for this run; `clean_build: true` forces
+   a cold build (cache untouched).
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
@@ -325,23 +327,23 @@ The subnets still must route to your internal resources (Nexus, validation
 services) via your own NAT/Transit Gateway/peering. Nothing else changes — the
 same six MCP tools work whether or not the fleet is in a VPC.
 
-### Speed up the fix → retest loop (build cache)
+### The fix → retest loop (build cache)
 
-Every build is cold by default. For the tight agent loop (fix → push → retest),
-enable a cache so only changed files recompile — set `cacheMode`:
+**Builds are incremental by default** (`cacheMode=local`): the first build of an
+app is cold, but every build after reuses warm DerivedData/SPM on the reserved
+Mac, so re-tests finish in a fraction of the time. That is the whole point of the
+agent loop, so it is on out of the box — no flag needed.
 
 | `cacheMode` | What it does | Best for |
 | ----------- | ------------ | -------- |
-| `none` (default) | Every build clones + compiles from scratch | one-off runs |
-| `local` | DerivedData + source stay warm on the reserved Mac (fastest; no upload/download) | one shared project building many apps |
+| `local` (default) | DerivedData + source stay warm on the reserved Mac (fastest; no upload/download) | the agent fix→retest loop; one shared project building many apps |
+| `none` | Every build clones + compiles from scratch | always-clean validation only |
 | `s3` | Cache stored durably in the artifacts bucket under `cache/`; survives instance replacement | one-project-per-app, or when you need the cache to outlive the fleet |
 
-```bash
-cdk deploy ... -c codebuild-ios-mcp:cacheMode=local
-```
-
-First build is still cold; subsequent builds reuse DerivedData/SPM and finish in
-a fraction of the time. The cache paths live in `buildspec.yaml`'s `cache:` block.
+Need a guaranteed cold build for one run without changing the deploy? Pass
+**`clean_build: true`** to `ios_test` — it skips the cached DerivedData for that
+run and leaves the cache intact for the next. No redeploy. The cache paths live
+in `buildspec.yaml`'s `cache:` block.
 
 ### Many apps on one stack
 

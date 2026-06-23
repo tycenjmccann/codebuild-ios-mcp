@@ -11,7 +11,8 @@
         "os_version": { "type": "string", "description": "iOS version (e.g. '18.2' or 'latest')" },
         "test_plan": { "type": "string", "description": "Optional test plan name (empty = default)" },
         "repo": { "type": "string", "description": "Optional GitHub repo URL to build (multi-app: point the shared project at this repo for this run). Omit to use the project's configured repo." },
-        "project_dir": { "type": "string", "description": "Optional subdir holding the .xcworkspace/.xcodeproj (e.g. 'ios'). Omit to use the project default." }
+        "project_dir": { "type": "string", "description": "Optional subdir holding the .xcworkspace/.xcodeproj (e.g. 'ios'). Omit to use the project default." },
+        "clean_build": { "type": "boolean", "description": "Force a cold build for this run, skipping the cached DerivedData (cache is left intact for the next run). Builds are incremental by default; set true when a cached incremental build looks wrong or for a guaranteed-clean validation run." }
       },
       "required": ["branch", "scheme"]
     }

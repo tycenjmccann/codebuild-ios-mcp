@@ -15,6 +15,7 @@ env:
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
     CACHE_MODE: "none"  # none | local | s3 — set by the CDK stack's cacheMode
+    CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build, cache untouched
 
 phases:
   build:
@@ -68,8 +69,16 @@ phases:
           # CACHE_MODE local/s3 -> point DerivedData at a cached dir so only changed
           # files recompile on the next run (the tight fix->retest loop). The paths
           # in this file's `cache:` block are what CodeBuild persists.
+          # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS run
+          # without disturbing the cache: it points DerivedData at a fresh ephemeral
+          # dir, so nothing cached is reused and the cache is left intact for next time.
           DERIVED_ARGS=()
-          if [ "$CACHE_MODE" != "none" ]; then
+          if [ "$CLEAN_BUILD" = "true" ]; then
+            DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
+            mkdir -p "$DERIVED"
+            DERIVED_ARGS=(-derivedDataPath "$DERIVED")
+            echo "Clean build requested -> fresh DerivedData at $DERIVED (cache untouched)"
+          elif [ "$CACHE_MODE" != "none" ]; then
             DERIVED="/tmp/ios-mcp-cache/DerivedData"
             mkdir -p "$DERIVED"
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
