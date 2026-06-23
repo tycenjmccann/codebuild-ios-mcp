@@ -198,6 +198,44 @@ python examples/connect_agent.py --list   # auth + tool-discovery smoke test (no
 python examples/connect_agent.py          # run an agent that drives a test build
 ```
 
+### Test it locally from a desktop MCP client (Claude Code, Cursor, Q CLI)
+
+Want to poke at the tools from your laptop instead of a cloud agent? Desktop MCP
+clients speak MCP but their HTTP transport only sends **static headers**, so they
+can't SigV4-sign, and the gateway is `AWS_IAM`-gated. Bridge the gap with AWS
+Labs' [`mcp-proxy-for-aws`](https://github.com/awslabs/mcp-proxy-for-aws) (MIT,
+`uvx`-installable): a local stdio↔HTTP proxy that signs each call with your AWS
+credentials and forwards to the gateway. The client talks plain stdio to the
+proxy; the proxy does the auth.
+
+`register-gateway.sh` prints a ready-to-paste block with your real `GATEWAY_URL`
+and region filled in. It looks like this:
+
+```jsonc
+// ~/.claude.json  (or .mcp.json / Cursor / Amazon Q CLI mcp config)
+"mcpServers": {
+  "codebuild-ios": {
+    "command": "uvx",
+    "args": ["mcp-proxy-for-aws@latest",
+             "<GATEWAY_URL>",
+             "--service", "bedrock-agentcore",
+             "--region", "<REGION>"],
+    "env": { "AWS_PROFILE": "<your-profile>" }
+  }
+}
+```
+
+Three things that bite if you skip them:
+
+- **Signing proxy is required.** Desktop MCP clients can't SigV4-sign natively;
+  `mcp-proxy-for-aws` is the bridge. Don't paste `GATEWAY_URL` straight into a
+  client config — it will 403.
+- **Profile / account.** The proxy signs with whatever the AWS credential chain
+  resolves to. Pin `AWS_PROFILE` to a profile in the **gateway's account/region**,
+  or you'll sign as the wrong principal and get `AccessDenied`.
+- **It's IAM-gated.** That principal needs `bedrock-agentcore:InvokeGateway` on
+  the gateway ARN (the same grant the AgentCore Runtime role gets, below).
+
 ### AgentCore Runtime agents (the intended consumer)
 
 Nothing extra to wire. The runtime already executes under an IAM **execution

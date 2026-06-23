@@ -138,6 +138,33 @@ Gateway registered.
 Agents reach the four MCP tools at GATEWAY_URL using SigV4 (AWS_IAM auth).
 EOF
 
+# ----------------------------------------------------------------------------- #
+# Paste-ready config for a LOCAL desktop MCP client (Claude Code/Desktop, Cursor,
+# Q CLI). These clients can't SigV4-sign, so route through AWS Labs'
+# mcp-proxy-for-aws (uvx-installable) which signs each call with your AWS creds.
+# ----------------------------------------------------------------------------- #
+CALLER_PROFILE="${AWS_PROFILE:-default}"
+cat <<EOF
+----------------------------------------------------------------------------
+Test it locally from a desktop MCP client (Claude Code/Desktop, Cursor, Q CLI)
+----------------------------------------------------------------------------
+Desktop clients speak MCP but can't SigV4-sign, so route through AWS Labs'
+signing proxy. Add this to ~/.claude.json (or .mcp.json / Cursor / Q CLI),
+then ensure your creds resolve to THIS gateway's account ($REGION):
+
+  "mcpServers": {
+    "codebuild-ios": {
+      "command": "uvx",
+      "args": ["mcp-proxy-for-aws@latest", "$GATEWAY_URL",
+               "--service", "bedrock-agentcore", "--region", "$REGION"],
+      "env": { "AWS_PROFILE": "$CALLER_PROFILE" }
+    }
+  }
+
+Your IAM principal needs 'bedrock-agentcore:InvokeGateway' on:
+  $GATEWAY_ARN
+EOF
+
 if [ -n "$EXISTING_GATEWAY_ID" ]; then
   cat <<EOF
 NOTE (reused gateway): targets use GATEWAY_IAM_ROLE credentials, so the EXISTING
