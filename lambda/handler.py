@@ -40,17 +40,31 @@ def ios_test(args: dict) -> dict:
     ]
     if args.get("test_plan"):
         env.append({"name": "TEST_PLAN", "value": args["test_plan"], "type": "PLAINTEXT"})
+    # Per-call subdir override (multi-app on one shared project: each repo's
+    # .xcworkspace/.xcodeproj may live in a different subdir).
+    if args.get("project_dir"):
+        env.append({"name": "PROJECT_DIR", "value": args["project_dir"], "type": "PLAINTEXT"})
 
-    resp = codebuild.start_build(
-        projectName=PROJECT,
-        sourceVersion=branch,
-        environmentVariablesOverride=env,
-    )
+    start = {
+        "projectName": PROJECT,
+        "sourceVersion": branch,
+        "environmentVariablesOverride": env,
+    }
+    # Multi-app: point one shared project at any GitHub repo per call. Omit `repo`
+    # to use the project's configured source (single-app / per-app-project setups).
+    repo = args.get("repo")
+    if repo:
+        start["sourceTypeOverride"] = "GITHUB"
+        start["sourceLocationOverride"] = repo
+
+    resp = codebuild.start_build(**start)
     build_id = resp["build"]["id"]
     return {
         "status": "IN_PROGRESS",
         "build_id": build_id,
-        "message": f"Build started on branch '{branch}'. Poll ios_build_status with this build_id.",
+        "message": f"Build started on branch '{branch}'"
+                   + (f" (repo {repo})" if repo else "")
+                   + ". Poll ios_build_status with this build_id.",
     }
 
 

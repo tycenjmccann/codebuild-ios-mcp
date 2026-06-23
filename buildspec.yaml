@@ -14,6 +14,7 @@ env:
     OS_VERSION: "latest"
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
+    CACHE_MODE: "none"  # none | local | s3 — set by the CDK stack's cacheMode
 
 phases:
   build:
@@ -48,8 +49,20 @@ phases:
         fi
         xcrun simctl boot "$DEST_ID" || true
 
+        # --- build cache: reuse DerivedData across builds when enabled ---
+        # CACHE_MODE local/s3 -> point DerivedData at a cached dir so only changed
+        # files recompile on the next run (the tight fix->retest loop). The paths
+        # in this file's `cache:` block are what CodeBuild persists.
+        DERIVED_ARGS=()
+        if [ "$CACHE_MODE" != "none" ]; then
+          DERIVED="/tmp/ios-mcp-cache/DerivedData"
+          mkdir -p "$DERIVED"
+          DERIVED_ARGS=(-derivedDataPath "$DERIVED")
+          echo "Cache mode: $CACHE_MODE -> $DERIVED"
+        fi
+
         # --- resolve deps, then test ---
-        xcodebuild "${CONTAINER[@]}" -resolvePackageDependencies -scheme "$SCHEME" || true
+        xcodebuild "${CONTAINER[@]}" -resolvePackageDependencies -scheme "$SCHEME" "${DERIVED_ARGS[@]}" || true
         TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
         set +e
         xcodebuild test \
@@ -58,6 +71,7 @@ phases:
           -destination "id=$DEST_ID" \
           -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
           "${TESTPLAN_ARG[@]}" \
+          "${DERIVED_ARGS[@]}" \
           -enableCodeCoverage YES \
           2>&1 | tee "$CODEBUILD_SRC_DIR/build_output.log"
         TEST_RC=${PIPESTATUS[0]}
@@ -89,3 +103,12 @@ artifacts:
     - "build_output.log"
     - "screenshot_final.png"
   base-directory: "."
+
+# Paths CodeBuild persists between builds when cacheMode is 'local' or 's3'
+# (ignored when 'none'). DerivedData is the big win for the fix->retest loop;
+# SPM/CocoaPods caches avoid re-downloading dependencies.
+cache:
+  paths:
+    - "/tmp/ios-mcp-cache/DerivedData/**/*"
+    - "/Users/cbuser/Library/Caches/org.swift.swiftpm/**/*"
+    - "/Users/cbuser/Library/Caches/CocoaPods/**/*"

@@ -33,6 +33,9 @@
     "codebuild-ios-mcp:subnetIds": "",
     "codebuild-ios-mcp:securityGroupIds": "",
     "//createVpcEndpoints": "When VPC mode is on, also create S3 + CloudWatch Logs + CodeBuild VPC endpoints so a private no-NAT subnet works. Set false if your VPC already has a NAT gateway.",
-    "codebuild-ios-mcp:createVpcEndpoints": true
+    "codebuild-ios-mcp:createVpcEndpoints": true,
+
+    "//cacheMode": "Tighten the fix->retest loop by reusing DerivedData + SPM between builds. 'none' (default, every build cold), 'local' (cache persists on the warm reserved Mac — fastest, best for one shared project across many apps), or 's3' (durable cache in the artifacts bucket — survives instance replacement, best paired with one-project-per-app).",
+    "codebuild-ios-mcp:cacheMode": "none"
   }
 }

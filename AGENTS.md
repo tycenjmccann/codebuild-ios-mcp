@@ -49,6 +49,15 @@ npx cdk deploy -c codebuild-ios-mcp:githubRepo=<repo> -c codebuild-ios-mcp:proje
 Private repo: `aws codebuild import-source-credentials --server-type GITHUB
 --auth-type PERSONAL_ACCESS_TOKEN --token <pat>` once per account/region first.
 
+Cache (tighten fix→retest loop): add `-c codebuild-ios-mcp:cacheMode=local`
+(warm DerivedData on the reserved Mac; best for one shared project + many apps)
+or `=s3` (durable per-app cache; best for one-project-per-app). Default `none`.
+
+Many apps: ALWAYS one shared fleet (only cost) — never one fleet per app. Either
+one shared project (agent passes `repo` + `project_dir` to `ios_test` per call)
+or one stack/project per app (isolated history + s3 cache). Gateway/Lambda/tools
+are unchanged either way.
+
 VPC (internal Nexus / validation services): add
 `-c codebuild-ios-mcp:vpcId=… -c codebuild-ios-mcp:subnetIds=a,b -c codebuild-ios-mcp:securityGroupIds=sg`.
 Endpoints (S3+Logs+CodeBuild) are auto-created for no-NAT subnets; add

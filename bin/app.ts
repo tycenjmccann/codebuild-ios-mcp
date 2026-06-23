@@ -42,7 +42,14 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   // Default true: when VPC mode is on, also create S3/Logs/CodeBuild endpoints so
   // a private no-NAT subnet works out of the box. Set false if you have a NAT.
   createVpcEndpoints: bool(ctx<unknown>('createVpcEndpoints', true), true),
+  // Build cache to speed the fix->retest loop: 'none' | 'local' | 's3'.
+  cacheMode: cacheMode(ctx<string>('cacheMode', 'none')),
 });
+
+/** Validate the cacheMode context value, falling back to 'none'. */
+function cacheMode(v: string): 'none' | 'local' | 's3' {
+  return v === 'local' || v === 's3' ? v : 'none';
+}
 
 /** Parse a comma-separated context string into a trimmed, non-empty array. */
 function csv(v: string): string[] {

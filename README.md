@@ -129,6 +129,7 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:subnetIds`            | `""`                                                          | Comma-separated subnet ids for the fleet            |
 | `codebuild-ios-mcp:securityGroupIds`     | `""`                                                          | Comma-separated security group ids for the fleet    |
 | `codebuild-ios-mcp:createVpcEndpoints`   | `true`                                                        | When in a VPC, auto-create S3/Logs/CodeBuild endpoints (set `false` if you have a NAT) |
+| `codebuild-ios-mcp:cacheMode`            | `none`                                                        | Build cache: `none` / `local` / `s3` — speeds the fix→retest loop |
 
 See [Connect builds to your private network](#connect-builds-to-your-private-network-nexus-internal-services)
 for the VPC keys.
@@ -274,6 +275,40 @@ cdk deploy ... -c codebuild-ios-mcp:createVpcEndpoints=false
 The subnets still must route to your internal resources (Nexus, validation
 services) via your own NAT/Transit Gateway/peering. Nothing else changes — the
 same four MCP tools work whether or not the fleet is in a VPC.
+
+### Speed up the fix → retest loop (build cache)
+
+Every build is cold by default. For the tight agent loop (fix → push → retest),
+enable a cache so only changed files recompile — set `cacheMode`:
+
+| `cacheMode` | What it does | Best for |
+| ----------- | ------------ | -------- |
+| `none` (default) | Every build clones + compiles from scratch | one-off runs |
+| `local` | DerivedData + source stay warm on the reserved Mac (fastest; no upload/download) | one shared project building many apps |
+| `s3` | Cache stored durably in the artifacts bucket under `cache/`; survives instance replacement | one-project-per-app, or when you need the cache to outlive the fleet |
+
+```bash
+cdk deploy ... -c codebuild-ios-mcp:cacheMode=local
+```
+
+First build is still cold; subsequent builds reuse DerivedData/SPM and finish in
+a fraction of the time. The cache paths live in `buildspec.yaml`'s `cache:` block.
+
+### Many apps on one stack
+
+The fleet is the only standing cost — **always run one shared fleet**, never one
+per app. Two ways to serve multiple apps on it:
+
+- **One shared project (simplest).** Pass `repo` (and `project_dir`) to `ios_test`
+  per call; the shared project points at that GitHub repo for the run. Zero
+  per-app setup — add an app by aiming the tool at its repo. Pair with
+  `cacheMode=local`.
+- **One project per app.** Deploy the stack once per app (distinct `githubRepo`)
+  for isolated build history, logs, metrics, and an isolated `s3` cache prefix.
+  The enterprise shape (e.g. a large app with strict separation). Pair with
+  `cacheMode=s3`.
+
+Either way the Gateway, Lambda, and tools are unchanged.
 
 ### The buildspec is the single source of truth
 
