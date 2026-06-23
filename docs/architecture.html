@@ -47,7 +47,7 @@
     <!-- ============ LEFT: description ============ -->
     <aside class="side">
       <h2>Control flow</h2>
-      <div class="step"><div class="n">1</div><div class="t"><b>Agent → Gateway</b><br><span>SigV4-signed MCP over HTTPS (AWS_IAM auth)</span></div></div>
+      <div class="step"><div class="n">1</div><div class="t"><b>Agent → Gateway</b><br><span>SigV4-signed MCP over HTTPS (AWS_IAM auth). The agent keeps calling the <code>ios_build_status</code> tool here to poll for the result — there is no open connection.</span></div></div>
       <div class="step"><div class="n">2</div><div class="t"><b>Gateway → Lambda</b><br><span>assumes GatewayInvokeRole, invokes the tool handler</span></div></div>
       <div class="step"><div class="n">3</div><div class="t"><b>Lambda ⇄ CodeBuild</b> <span>(poll)</span><br><span><code>ios_test</code> starts the build; the agent loops <code>ios_build_status</code> until done, then reads <code>summary.json</code> + presigned URLs from S3</span></div></div>
       <div class="step"><div class="n">4</div><div class="t"><b>Build → internal</b><br><span>fleet reaches your Nexus &amp; validation services over the private path</span></div></div>
@@ -132,10 +132,6 @@
       <!-- 3 lambda <-> codebuild : StartBuild + repeated poll (round-trip) -->
       <path class="flow" d="M573,206 V256 H448 V378" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="510" cy="256" r="10" fill="#ec7211"/><text class="num" x="510" y="260" text-anchor="middle">3</text>
-      <!-- poll-loop glyph on leg 3 -->
-      <path d="M474,300 a13,13 0 1 1 -9,4" fill="none" stroke="#ec7211" stroke-width="1.8"/>
-      <path d="M465,304 l0,-8 l8,2 z" fill="#ec7211"/>
-      <text class="ilab2" x="492" y="312" fill="#9a4f00" style="font-family:ui-monospace,monospace;font-size:10px">poll</text>
       <!-- 4 fleet -> corporate (one-way: build reaches internal infra) -->
       <path class="flow" d="M540,581 H560 V850" marker-end="url(#ar--flow)"/>
       <circle cx="560" cy="784" r="10" fill="#ec7211"/><text class="num" x="560" y="788" text-anchor="middle">4</text>
