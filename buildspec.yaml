@@ -44,14 +44,20 @@ phases:
           local me; me="$(id -un)"
           for d in "$@"; do
             mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d" 2>/dev/null || true
-            sudo chown -R "$me" "$d" 2>/dev/null || true
+            sudo chown -R "$me" "$d" 2>/dev/null || chown -R "$me" "$d" 2>/dev/null || true
             chmod -R u+rwX "$d" 2>/dev/null || sudo chmod -R u+rwX "$d" 2>/dev/null || true
-            if ! ( : > "$d/.wtest" ) 2>/dev/null; then
-              echo "Cache dir still not writable, resetting cold: $d"
+            # A writable parent can still hide root-owned CHILDREN (e.g.
+            # DerivedData/SourcePackages/repositories) that survive a failed
+            # chown when sudo isn't honored on the cache mount. Probe the whole
+            # tree: any path not owned by us, or a failed NESTED write, means
+            # repair didn't take -> reset that dir cold so the run proceeds.
+            if find "$d" ! -user "$me" -print -quit 2>/dev/null | grep -q . \
+               || ! ( mkdir -p "$d/.wtest" && : > "$d/.wtest/probe" ) 2>/dev/null; then
+              echo "Cache dir poisoned/unwritable, resetting cold: $d"
               sudo rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
               mkdir -p "$d"
             fi
-            rm -f "$d/.wtest" 2>/dev/null || true
+            rm -rf "$d/.wtest" 2>/dev/null || true
           done
         }
 
