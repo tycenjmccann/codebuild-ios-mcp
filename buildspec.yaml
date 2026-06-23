@@ -32,6 +32,29 @@ phases:
         # the get_build_log tool reads, so the agent always sees the raw error.
         LOG="$CODEBUILD_SRC_DIR/build_output.log"
 
+        # Repair cache writability before xcodebuild touches it. CodeBuild macOS
+        # restores cached dirs (DerivedData, the SwiftPM home cache) from a prior
+        # build's tarball, which preserves ownership. If any earlier run wrote
+        # there as root, the restored files come back root-owned and the build
+        # user can't write them, so package resolution dies with POSIX 13
+        # "permission denied" mid-run. Reclaim ownership + perms; if a dir is
+        # still unwritable, reset it so the build proceeds cold and repopulates
+        # the cache cleanly — never a hard failure on a poisoned cache.
+        ensure_writable() {
+          local me; me="$(id -un)"
+          for d in "$@"; do
+            mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d" 2>/dev/null || true
+            sudo chown -R "$me" "$d" 2>/dev/null || true
+            chmod -R u+rwX "$d" 2>/dev/null || sudo chmod -R u+rwX "$d" 2>/dev/null || true
+            if ! ( : > "$d/.wtest" ) 2>/dev/null; then
+              echo "Cache dir still not writable, resetting cold: $d"
+              sudo rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
+              mkdir -p "$d"
+            fi
+            rm -f "$d/.wtest" 2>/dev/null || true
+          done
+        }
+
         # Everything below runs inside run() so we can pipe the whole thing to
         # tee and still recover the real exit code via PIPESTATUS. Use `return`
         # (never `exit`) inside run() so diagnostics upload regardless.
@@ -72,6 +95,10 @@ phases:
           # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS run
           # without disturbing the cache: it points DerivedData at a fresh ephemeral
           # dir, so nothing cached is reused and the cache is left intact for next time.
+          # The SwiftPM home cache is restored on every cached build and is the
+          # usual POSIX-13 culprit; heal it whenever the cache is in play. Use
+          # the literal path the `cache:` block persists so the two can't drift.
+          SPM_HOME="/Users/cbuser/Library/Caches/org.swift.swiftpm"
           DERIVED_ARGS=()
           if [ "$CLEAN_BUILD" = "true" ]; then
             DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
@@ -80,8 +107,8 @@ phases:
             echo "Clean build requested -> fresh DerivedData at $DERIVED (cache untouched)"
           elif [ "$CACHE_MODE" != "none" ]; then
             DERIVED="/tmp/ios-mcp-cache/DerivedData"
-            mkdir -p "$DERIVED"
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
+            ensure_writable "$DERIVED" "$SPM_HOME"
             echo "Cache mode: $CACHE_MODE -> $DERIVED"
           fi
 
