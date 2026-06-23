@@ -33,7 +33,7 @@ What `cdk deploy` creates:
   seeded with `tooling/xcresult_to_junit.py` (used by the buildspec to convert
   `.xcresult` to JUnit XML).
 - **MAC_ARM reserved CodeBuild fleet** — `BUILD_GENERAL1_MEDIUM`, image
-  `aws/codebuild/macos-arm-base:14`, baseCapacity 1, overflow `QUEUE`. Modeled
+  `aws/codebuild/macos-arm-base:14`, `baseCapacity` (default 1), overflow `QUEUE`. Modeled
   with `AWS::CodeBuild::Fleet` (`CfnFleet`) because no L2/L1 construct exists.
 - **CodeBuild project** `ios-agent-tests` — GITHUB source (your iOS repo), the
   buildspec embedded **inline** from `buildspec.yaml`, attached to the fleet,
@@ -57,7 +57,9 @@ This is a one-time step.
 > running.** Reserved macOS capacity is roughly **$25-30/day per instance**, and
 > Apple licensing imposes a **~24-hour minimum lease** per dedicated host, so you
 > are billed for at least a full day even if you delete the fleet minutes after
-> creating it. With `baseCapacity: 1` you have one always-on instance.
+> creating it. With `baseCapacity: 1` (default) you have one always-on instance;
+> each extra slot you add is another full ~$25-30/day, billed flat whether idle
+> or busy. Size to peak concurrency, and scale down off-hours (see below).
 >
 > Treat this stack as something you stand up, use, and **tear down** — not leave
 > running idle. See [Teardown](#teardown). On-demand (`ON_DEMAND`) overflow is not
@@ -99,6 +101,7 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:sourceVersion`        | `main`                                                          | Default branch/SHA the project checks out          |
 | `codebuild-ios-mcp:projectDir`           | `.`                                                            | Subdir holding the `.xcworkspace`/`.xcodeproj`     |
 | `codebuild-ios-mcp:defaultDevice`        | `iPhone 17`                                                     | Default simulator device name                      |
+| `codebuild-ios-mcp:baseCapacity`         | `1`                                                            | Always-on reserved Macs = concurrent build slots (each ~$25-30/day; builds beyond it queue) |
 | `codebuild-ios-mcp:artifactRetentionDays`| `14`                                                           | Days before `builds/` artifacts expire             |
 | `codebuild-ios-mcp:presignTtlSec`        | `3600`                                                         | TTL (seconds) for presigned artifact URLs          |
 | `codebuild-ios-mcp:vpcId`                | `""` (no VPC)                                                  | VPC to run builds in (reach private Nexus/services) |

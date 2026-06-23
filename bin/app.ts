@@ -32,6 +32,10 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   sourceVersion: ctx<string>('sourceVersion', 'main'),
   projectDir: ctx<string>('projectDir', '.'),
   defaultDevice: ctx<string>('defaultDevice', 'iPhone 17'),
+  // Concurrent build slots = always-on reserved Macs. Each one bills ~$25-30/day
+  // whether idle or not. 1 = sequential (builds queue); raise for a shared pool
+  // sized to PEAK concurrency, not headcount (cached builds are short + bursty).
+  baseCapacity: Math.max(1, Number(ctx<number>('baseCapacity', 1))),
   artifactRetentionDays: Number(ctx<number>('artifactRetentionDays', 14)),
   presignTtlSec: Number(ctx<number>('presignTtlSec', 3600)),
   // Optional VPC wiring — populate to reach private resources (Nexus, internal

@@ -25,6 +25,8 @@
     "codebuild-ios-mcp:sourceVersion": "main",
     "codebuild-ios-mcp:projectDir": ".",
     "codebuild-ios-mcp:defaultDevice": "iPhone 17",
+    "//baseCapacity": "Always-on reserved Macs = concurrent build slots. Each instance bills ~$25-30/day whether idle or busy; builds beyond the count QUEUE (ON_DEMAND is unavailable for MAC_ARM). Size to PEAK concurrency, not headcount. Default 1 (sequential).",
+    "codebuild-ios-mcp:baseCapacity": 1,
     "codebuild-ios-mcp:artifactRetentionDays": 14,
     "codebuild-ios-mcp:presignTtlSec": 3600,
 

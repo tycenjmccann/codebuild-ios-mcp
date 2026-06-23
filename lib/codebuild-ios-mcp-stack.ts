@@ -22,6 +22,13 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly projectDir: string;
   /** Default simulator device name (informational; ios_test can override). */
   readonly defaultDevice: string;
+  /**
+   * Number of always-on reserved Macs = concurrent build slots. Builds beyond
+   * this queue (overflow is QUEUE; ON_DEMAND is unavailable for MAC_ARM). Each
+   * instance bills continuously (~$25-30/day), so size to PEAK concurrency, not
+   * team headcount. Default 1 (sequential).
+   */
+  readonly baseCapacity: number;
   /** Days before objects under builds/ expire in the artifacts bucket. */
   readonly artifactRetentionDays: number;
   /** TTL (seconds) for presigned artifact URLs returned by the Lambda. */
@@ -230,7 +237,7 @@ export class CodebuildIosMcpStack extends cdk.Stack {
 
     const fleet = new codebuild.CfnFleet(this, 'MacArmFleet', {
       name: fleetName,
-      baseCapacity: 1,
+      baseCapacity: props.baseCapacity,
       computeType: 'BUILD_GENERAL1_MEDIUM',
       environmentType: 'MAC_ARM',
       overflowBehavior: 'QUEUE',
