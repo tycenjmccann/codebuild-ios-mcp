@@ -5,66 +5,96 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>codebuild-ios-mcp — AWS Architecture</title>
 <style>
-  :root{ --ink:#232f3e; --muted:#5b6b7b; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Arial,sans-serif;
+  :root{ --ink:#232f3e; --muted:#5b6b7b; --opt:#8c4fff;
+         --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Arial,sans-serif;
          --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
   html,body{margin:0;background:#fff;color:var(--ink);font-family:var(--sans)}
-  .wrap{max-width:1340px;margin:0 auto;padding:28px 24px 44px}
+  .wrap{max-width:1360px;margin:0 auto;padding:28px 24px 44px}
   h1{font-size:22px;margin:0 0 2px;letter-spacing:-.3px}
   h1 .m{font-family:var(--mono);color:#8c4fff}
   .sub{color:var(--muted);font-size:13.5px;margin:0 0 18px;max-width:900px;line-height:1.5}
 
   .layout{display:flex;gap:30px;align-items:flex-start}
-  .side{width:312px;flex:none}
+  .side{width:330px;flex:none}
   .diagram{flex:1;min-width:0}
   svg{width:100%;height:auto;display:block;border:1px solid #e6e9ee;border-radius:10px;background:#fff}
 
-  .side h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
-    margin:2px 0 12px;font-weight:700}
-  .step{display:flex;gap:11px;margin-bottom:15px;align-items:flex-start}
-  .step .n{flex:none;width:22px;height:22px;border-radius:50%;background:#ec7211;color:#fff;
-    font-size:12px;font-weight:700;text-align:center;line-height:22px;font-family:var(--mono);margin-top:1px}
-  .step .t{font-size:13.5px;line-height:1.45}
-  .step .t b{color:var(--ink)} .step .t span{color:var(--muted)}
-  .datakey{display:flex;gap:11px;align-items:flex-start;margin:18px 0 0;padding-top:14px;border-top:1px solid #eceff2}
-  .datakey .sw{flex:none;width:22px;margin-top:9px}
-  .datakey .sw svg{border:0;width:22px;height:8px}
-  .datakey .t{font-size:13px;color:var(--muted);line-height:1.45}
-  .cost{margin-top:18px;padding:12px 13px;border:1px solid #f0d9a8;border-radius:9px;
+  /* legend swatches */
+  .key{display:flex;flex-direction:column;gap:7px;margin:0 0 18px;padding-bottom:16px;border-bottom:1px solid #eceff2}
+  .key .r{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--muted)}
+  .key .r b{color:var(--ink)}
+  .key svg{border:0;width:34px;height:10px;flex:none}
+
+  .grp{font-size:11px;text-transform:uppercase;letter-spacing:.7px;font-weight:700;margin:18px 0 10px}
+  .grp.req{color:#c4661a} .grp.opt{color:var(--opt)}
+  .grp:first-of-type{margin-top:0}
+  .sec{margin-bottom:14px}
+  .sec .h{display:flex;gap:9px;align-items:center;font-size:13.5px;font-weight:700;color:var(--ink);margin-bottom:5px}
+  .sec .h .n{flex:none;width:21px;height:21px;border-radius:50%;color:#fff;font-size:11px;font-weight:700;
+    text-align:center;line-height:21px;font-family:var(--mono)}
+  .sec.req .h .n{background:#ec7211} .sec.opt .h .n{background:var(--opt)}
+  .sec .h .tag{flex:none;width:auto;font-size:10px;font-weight:700;color:var(--opt);border:1px solid var(--opt);
+    border-radius:4px;padding:1px 5px;text-transform:uppercase;letter-spacing:.4px}
+  .sec ul{margin:0;padding-left:32px;list-style:none}
+  .sec li{font-size:12.5px;color:var(--muted);line-height:1.5;margin-bottom:4px;position:relative}
+  .sec li::before{content:"–";position:absolute;left:-14px;color:#b9c1cb}
+  .sec li code{font-family:var(--mono);font-size:11px;color:var(--ink)}
+  .sec li b{color:var(--ink)}
+
+  .cost{margin-top:8px;padding:12px 13px;border:1px solid #f0d9a8;border-radius:9px;
     background:#fffaf0;font-size:12.5px;line-height:1.5;color:#7a5a16}
   .cost b{color:#b3741e}
-  .poll{margin-top:18px;padding:12px 13px;border:1px solid #cfe3f2;border-radius:9px;
-    background:#f3f9fd;font-size:12.5px;line-height:1.55;color:#33576f}
-  .poll b{color:#1d6291} .poll code{font-family:var(--mono);font-size:11px;color:#1d6291}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1><span class="m">codebuild-ios-mcp</span> — AWS Architecture</h1>
   <p class="sub">Agent-driven iOS build &amp; test on AWS CodeBuild macOS, exposed as four MCP tools through a
-     Bedrock AgentCore Gateway. Optional VPC mode reaches internal Nexus &amp; validation services.</p>
+     Bedrock AgentCore Gateway. Solid = required core; dashed purple = optional add-ons.</p>
 
   <div class="layout">
     <!-- ============ LEFT: description ============ -->
     <aside class="side">
-      <h2>Control flow</h2>
-      <div class="step"><div class="n">1</div><div class="t"><b>Agent → Gateway</b><br><span>SigV4-signed MCP over HTTPS (AWS_IAM auth). The agent keeps calling the <code>ios_build_status</code> tool here to poll for the result — there is no open connection.</span></div></div>
-      <div class="step"><div class="n">2</div><div class="t"><b>Gateway → Lambda</b><br><span>assumes GatewayInvokeRole, invokes the tool handler</span></div></div>
-      <div class="step"><div class="n">3</div><div class="t"><b>Lambda ⇄ CodeBuild</b> <span>(poll)</span><br><span><code>ios_test</code> starts the build; the agent loops <code>ios_build_status</code> until done, then reads <code>summary.json</code> + presigned URLs from S3</span></div></div>
-      <div class="step"><div class="n">4</div><div class="t"><b>Build → internal</b><br><span>fleet reaches your Nexus &amp; validation services over the private path</span></div></div>
-
-      <div class="datakey">
-        <div class="sw"><svg viewBox="0 0 22 8"><path d="M0,4 H18" stroke="#6b7785" stroke-width="1.7" stroke-dasharray="5 3" fill="none"/><path d="M16,1 L22,4 L16,7 z" fill="#6b7785"/></svg></div>
-        <div class="t"><b style="color:var(--ink)">Dashed</b> = data / artifact paths: build source (git clone), artifact upload to S3, and AWS API access via VPC endpoints.</div>
+      <div class="key">
+        <div class="r"><svg viewBox="0 0 34 10"><path d="M0,5 H30" stroke="#ec7211" stroke-width="2.4"/><path d="M28,2 L34,5 L28,8 z" fill="#ec7211"/></svg><span><b>Required</b> — core request/response path</span></div>
+        <div class="r"><svg viewBox="0 0 34 10"><rect x="1" y="1" width="32" height="8" rx="2" fill="none" stroke="#8c4fff" stroke-width="1.4" stroke-dasharray="5 3"/></svg><span><b style="color:#7a48cc">Optional</b> — VPC, endpoints, internal network</span></div>
       </div>
 
-      <div class="poll">
-        <b>How the agent learns the result</b><br>
-        Polling, not push. Each MCP call is a synchronous round-trip.
-        <code>ios_test</code> returns a <code>build_id</code> immediately, then the
-        agent calls <code>ios_build_status(build_id)</code> on a loop until
-        <code>status</code> leaves <code>IN_PROGRESS</code> →
-        <code>SUCCEEDED</code> / <code>FAILED</code> / <code>BUILD_ERROR</code> /
-        <code>TIMED_OUT</code>.
+      <div class="grp req">Required · core flow</div>
+      <div class="sec req">
+        <div class="h"><span class="n">1</span> Agent ⇄ Gateway</div>
+        <ul>
+          <li>SigV4-signed MCP over HTTPS (<code>AWS_IAM</code>)</li>
+          <li>Agent polls the <code>ios_build_status</code> tool here — no open connection</li>
+        </ul>
+      </div>
+      <div class="sec req">
+        <div class="h"><span class="n">2</span> Gateway → Lambda</div>
+        <ul><li>Gateway assumes <code>GatewayInvokeRole</code>, invokes the tool handler</li></ul>
+      </div>
+      <div class="sec req">
+        <div class="h"><span class="n">3</span> Lambda → CodeBuild → S3</div>
+        <ul>
+          <li><code>ios_test</code> runs <code>StartBuild</code> on the macOS fleet</li>
+          <li>Fleet runs <code>xcodebuild test</code>, writes <code>summary.json</code> + artifacts to S3</li>
+          <li>Lambda reads them back; agent loops until <code>SUCCEEDED</code> / <code>FAILED</code> / <code>BUILD_ERROR</code></li>
+        </ul>
+      </div>
+
+      <div class="grp opt">Optional · add-ons</div>
+      <div class="sec opt">
+        <div class="h"><span class="n">4</span> Private network <span class="tag">VPC</span></div>
+        <ul>
+          <li>Fleet joins your VPC to reach internal <b>Nexus</b> &amp; validation services</li>
+          <li>Auto-creates S3 / Logs / CodeBuild endpoints — works with no NAT</li>
+        </ul>
+      </div>
+      <div class="sec opt">
+        <div class="h"><span class="n">5</span> Speed &amp; scale <span class="tag">tune</span></div>
+        <ul>
+          <li><code>cacheMode</code> <code>local</code>/<code>s3</code> — warm DerivedData → faster retest</li>
+          <li>Multi-app: <b>one shared fleet</b>; one shared project or one per app</li>
+        </ul>
       </div>
 
       <div class="cost"><b>⚠ Cost:</b> the MAC_ARM reserved fleet bills continuously (~$25–30/day per instance, ~24 h minimum lease). Tear it down when idle.</div>
@@ -76,115 +106,126 @@
       <defs>
         <marker id="ar--flow" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
           <path d="M0,0 L9,5 L0,10 z" fill="#ec7211"/></marker>
-        <marker id="ar--data" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
-          <path d="M0,0 L9,5 L0,10 z" fill="#6b7785"/></marker>
         <marker id="ar--flowR" markerWidth="10" markerHeight="10" refX="1.5" refY="5" orient="auto">
           <path d="M9,0 L0,5 L9,10 z" fill="#ec7211"/></marker>
+        <marker id="ar--data" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
+          <path d="M0,0 L9,5 L0,10 z" fill="#6b7785"/></marker>
         <style>
           .flow{stroke:#ec7211;stroke-width:2.2;fill:none}
           .data{stroke:#6b7785;stroke-width:1.6;fill:none;stroke-dasharray:6 4}
           .glab{font-size:13px;font-weight:700}
           .ilab{font-size:12.5px;fill:#232f3e;font-weight:600}
           .ilab2{font-size:11px;fill:#5b6b7b}
+          .cap{font-size:10px;fill:#9a4f00;font-family:ui-monospace,Menlo,monospace}
           .num{font-size:12px;font-weight:700;fill:#fff;font-family:ui-monospace,monospace}
-          .ilab,.ilab2,.glab{paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}
+          .opttag{font-size:9.5px;font-weight:700;fill:#8c4fff;font-family:ui-monospace,monospace;letter-spacing:.4px}
+          .ilab,.ilab2,.glab,.cap{paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}
         </style>
       </defs>
 
-      <!-- ============ CONTAINERS ============ -->
-      <!-- AWS Cloud -->
-      <rect x="150" y="28" width="820" height="788" rx="10" fill="none" stroke="#232f3e" stroke-width="2"/>
-      <rect x="164" y="40" width="26" height="26" rx="5" fill="#232f3e"/>
-      <text x="177" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="ui-monospace,monospace">aws</text>
-      <text class="glab" x="200" y="58" fill="#232f3e">AWS Cloud</text>
-      <!-- Region -->
-      <rect x="174" y="78" width="780" height="724" rx="8" fill="none" stroke="#00a4a6" stroke-width="1.4" stroke-dasharray="7 5"/>
-      <text class="glab" x="192" y="99" fill="#147c8b" font-size="12.5">Region · us-east-1</text>
-      <!-- VPC -->
-      <rect x="300" y="300" width="540" height="430" rx="9" fill="rgba(140,79,255,.04)" stroke="#8c4fff" stroke-width="2"/>
+      <!-- ===================== CONTAINERS ===================== -->
+      <!-- AWS Cloud (core) -->
+      <rect x="40" y="28" width="920" height="744" rx="10" fill="none" stroke="#232f3e" stroke-width="2"/>
+      <rect x="54" y="40" width="26" height="26" rx="5" fill="#232f3e"/>
+      <text x="67" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="ui-monospace,monospace">aws</text>
+      <text class="glab" x="90" y="58" fill="#232f3e">AWS Cloud</text>
+      <!-- Region (core) -->
+      <rect x="64" y="78" width="872" height="680" rx="8" fill="none" stroke="#00a4a6" stroke-width="1.4" stroke-dasharray="7 5"/>
+      <text class="glab" x="82" y="99" fill="#147c8b" font-size="12.5">Region · us-east-1</text>
+
+      <!-- VPC (OPTIONAL) -->
+      <rect x="300" y="300" width="600" height="430" rx="9" fill="rgba(140,79,255,.045)" stroke="#8c4fff" stroke-width="1.8" stroke-dasharray="8 5"/>
       <image href="./assets/aws/vpc.png" x="312" y="286" width="27" height="27"/>
-      <text class="glab" x="347" y="306" fill="#8c4fff">Customer VPC <tspan fill="#9a7fd0" font-weight="400">(optional)</tspan></text>
+      <text class="glab" x="347" y="306" fill="#8c4fff">Customer VPC</text>
+      <text class="opttag" x="452" y="305">OPTIONAL</text>
       <!-- Private subnet -->
-      <rect x="322" y="346" width="252" height="360" rx="7" fill="#eaf5f7" stroke="#00a4a6" stroke-width="1.5"/>
+      <rect x="322" y="346" width="262" height="362" rx="7" fill="#eaf5f7" stroke="#00a4a6" stroke-width="1.5"/>
       <image href="./assets/aws/private-subnet.png" x="334" y="332" width="25" height="25"/>
       <text class="glab" x="367" y="352" fill="#147c8b" font-size="12px">Private subnet</text>
-      <!-- VPC endpoints -->
-      <rect x="598" y="346" width="222" height="360" rx="7" fill="rgba(140,79,255,.05)" stroke="#8c4fff" stroke-width="1.2" stroke-dasharray="6 4"/>
-      <text class="glab" x="709" y="370" fill="#8c4fff" font-size="11.5" text-anchor="middle">VPC endpoints · PrivateLink</text>
+      <!-- VPC endpoints (OPTIONAL) -->
+      <rect x="608" y="346" width="272" height="362" rx="7" fill="rgba(140,79,255,.05)" stroke="#8c4fff" stroke-width="1.1" stroke-dasharray="6 4"/>
+      <text class="glab" x="744" y="370" fill="#8c4fff" font-size="11.5" text-anchor="middle">VPC endpoints · PrivateLink</text>
 
-      <!-- Corporate network (external) -->
-      <rect x="150" y="850" width="820" height="142" rx="9" fill="#f4f6f8" stroke="#5b6b7b" stroke-width="1.5"/>
-      <text class="glab" x="168" y="874" fill="#5b6b7b">Corporate network (on-prem or shared VPC)</text>
-      <rect x="300" y="892" width="300" height="84" rx="8" fill="#fff" stroke="#c4ccd6"/>
-      <text class="ilab" x="450" y="926" text-anchor="middle">Nexus / artifact repo</text>
-      <text class="ilab2" x="450" y="945" text-anchor="middle">build-time: SPM · CocoaPods · Gradle</text>
-      <rect x="640" y="892" width="300" height="84" rx="8" fill="#fff" stroke="#c4ccd6"/>
-      <text class="ilab" x="790" y="926" text-anchor="middle">Internal validation services</text>
-      <text class="ilab2" x="790" y="945" text-anchor="middle">test-time: private APIs &amp; tools</text>
+      <!-- ===================== EXTERNAL BOTTOM ROW ===================== -->
+      <!-- GitHub (left, inline) -->
+      <rect x="40" y="812" width="210" height="180" rx="9" fill="#fbfbfc" stroke="#c4ccd6" stroke-width="1.4"/>
+      <image href="./assets/aws/github.png" x="118" y="838" width="54" height="54"/>
+      <text class="ilab" x="145" y="912" text-anchor="middle">GitHub</text>
+      <text class="ilab2" x="145" y="930" text-anchor="middle">your iOS repo (source)</text>
+      <!-- Corporate network (OPTIONAL, narrower, right) -->
+      <rect x="280" y="812" width="680" height="180" rx="9" fill="rgba(140,79,255,.04)" stroke="#8c4fff" stroke-width="1.5" stroke-dasharray="8 5"/>
+      <text class="glab" x="300" y="838" fill="#7a48cc">Corporate network (on-prem or shared VPC)</text>
+      <text class="opttag" x="300" y="856">OPTIONAL</text>
+      <rect x="320" y="872" width="290" height="96" rx="8" fill="#fff" stroke="#c4ccd6"/>
+      <text class="ilab" x="465" y="912" text-anchor="middle">Nexus / artifact repo</text>
+      <text class="ilab2" x="465" y="931" text-anchor="middle">build-time: SPM · CocoaPods · Gradle</text>
+      <rect x="636" y="872" width="290" height="96" rx="8" fill="#fff" stroke="#c4ccd6"/>
+      <text class="ilab" x="781" y="912" text-anchor="middle">Internal validation services</text>
+      <text class="ilab2" x="781" y="931" text-anchor="middle">test-time: private APIs &amp; tools</text>
 
-      <!-- ============ FLOW ARROWS (round-trip: each call returns a response) ============ -->
+      <!-- ===================== FLOW ARROWS ===================== -->
       <!-- 1 agent <-> gateway -->
-      <path class="flow" d="M268,176 H366" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
-      <circle cx="305" cy="176" r="10" fill="#ec7211"/><text class="num" x="305" y="180" text-anchor="middle">1</text>
+      <path class="flow" d="M178,176 H274" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
+      <circle cx="226" cy="176" r="10" fill="#ec7211"/><text class="num" x="226" y="180" text-anchor="middle">1</text>
       <!-- 2 gateway <-> lambda -->
-      <path class="flow" d="M436,176 H542" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
-      <circle cx="489" cy="176" r="10" fill="#ec7211"/><text class="num" x="489" y="180" text-anchor="middle">2</text>
-      <!-- 3 lambda <-> codebuild : StartBuild + repeated poll (round-trip) -->
-      <path class="flow" d="M573,206 V256 H448 V378" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
-      <circle cx="510" cy="256" r="10" fill="#ec7211"/><text class="num" x="510" y="260" text-anchor="middle">3</text>
-      <!-- 4 fleet -> corporate (one-way: build reaches internal infra) -->
-      <path class="flow" d="M540,581 H560 V850" marker-end="url(#ar--flow)"/>
-      <circle cx="560" cy="784" r="10" fill="#ec7211"/><text class="num" x="560" y="788" text-anchor="middle">4</text>
+      <path class="flow" d="M344,176 H450" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
+      <circle cx="397" cy="176" r="10" fill="#ec7211"/><text class="num" x="397" y="180" text-anchor="middle">2</text>
+      <!-- 3 lambda <-> codebuild -->
+      <path class="flow" d="M479,206 V256 H453 V378" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
+      <circle cx="466" cy="300" r="10" fill="#ec7211"/><text class="num" x="466" y="304" text-anchor="middle">3</text>
+      <!-- lambda <-> s3 (data) -->
+      <path class="data" d="M508,176 H872 V322" marker-start="url(#ar--data)" marker-end="url(#ar--data)"/>
+      <!-- codebuild -> fleet -->
+      <path class="flow" d="M453,432 V544" marker-end="url(#ar--flow)"/>
+      <!-- codebuild -> endpoints -->
+      <path class="data" d="M511,409 H682" marker-end="url(#ar--data)"/>
+      <!-- fleet -> endpoints -->
+      <path class="data" d="M511,581 H682" marker-end="url(#ar--data)"/>
+      <!-- s3 endpoint -> regional s3 -->
+      <path class="data" d="M772,410 H822 V362 H856" marker-end="url(#ar--data)"/>
+      <!-- 4 fleet -> corporate (optional path) -->
+      <path class="flow" d="M560,581 H572 V812" marker-end="url(#ar--flow)"/>
+      <circle cx="572" cy="760" r="10" fill="#ec7211"/><text class="num" x="572" y="764" text-anchor="middle">4</text>
+      <!-- github -> codebuild (git clone) -->
+      <path class="data" d="M145,812 V740 H300 V405 H448" marker-end="url(#ar--data)"/>
 
-      <!-- data (dashed, no labels) -->
-      <path class="data" d="M602,176 H892 V322" marker-end="url(#ar--data)"/>            <!-- lambda -> s3 -->
-      <path class="data" d="M476,409 H672" marker-end="url(#ar--data)"/>                  <!-- codebuild -> endpoints -->
-      <path class="data" d="M476,581 H672" marker-end="url(#ar--data)"/>                  <!-- fleet -> endpoints -->
-      <path class="data" d="M726,410 H812 V362 H856" marker-end="url(#ar--data)"/>        <!-- s3 endpoint -> s3 -->
-      <path class="data" d="M98,640 H200 V407 H414" marker-end="url(#ar--data)"/>         <!-- github -> codebuild -->
-
-      <!-- ============ ICONS ============ -->
-      <!-- agent (now inside AWS) -->
-      <image href="./assets/aws/users.png" x="208" y="148" width="58" height="58"/>
-      <text class="ilab" x="237" y="224" text-anchor="middle">AgentCore agent</text>
-      <text class="ilab2" x="237" y="239" text-anchor="middle">runtime · exec role</text>
+      <!-- ===================== ICONS ===================== -->
+      <!-- agent (inside AWS) -->
+      <image href="./assets/aws/users.png" x="120" y="148" width="58" height="58"/>
+      <text class="ilab" x="149" y="224" text-anchor="middle">AgentCore agent</text>
+      <text class="ilab2" x="149" y="239" text-anchor="middle">runtime · exec role</text>
       <!-- gateway -->
-      <image href="./assets/aws/bedrock.png" x="372" y="148" width="58" height="58"/>
-      <text class="ilab" x="401" y="224" text-anchor="middle">AgentCore Gateway</text>
-      <text class="ilab2" x="401" y="239" text-anchor="middle">AWS_IAM · MCP</text>
+      <image href="./assets/aws/bedrock.png" x="278" y="148" width="58" height="58"/>
+      <text class="ilab" x="307" y="224" text-anchor="middle">AgentCore Gateway</text>
+      <text class="ilab2" x="307" y="239" text-anchor="middle">AWS_IAM · MCP</text>
       <!-- role -->
-      <image href="./assets/aws/iam-role.png" x="470" y="100" width="36" height="36"/>
-      <text class="ilab2" x="488" y="150" text-anchor="middle">GatewayInvokeRole</text>
-      <path d="M488,138 V168" stroke="#c4a6ff" stroke-width="1.3" stroke-dasharray="3 3" fill="none"/>
+      <image href="./assets/aws/iam-role.png" x="380" y="102" width="34" height="34"/>
+      <text class="ilab2" x="397" y="150" text-anchor="middle">GatewayInvokeRole</text>
+      <path d="M397,138 V168" stroke="#c4a6ff" stroke-width="1.3" stroke-dasharray="3 3" fill="none"/>
       <!-- lambda -->
-      <image href="./assets/aws/lambda.png" x="544" y="148" width="58" height="58"/>
-      <text class="ilab" x="573" y="224" text-anchor="middle">Lambda</text>
-      <text class="ilab2" x="573" y="239" text-anchor="middle">codebuild-ios-mcp</text>
+      <image href="./assets/aws/lambda.png" x="450" y="148" width="58" height="58"/>
+      <text class="ilab" x="479" y="224" text-anchor="middle">Lambda</text>
+      <text class="ilab2" x="479" y="239" text-anchor="middle">codebuild-ios-mcp</text>
       <!-- s3 -->
-      <image href="./assets/aws/s3.png" x="862" y="316" width="58" height="58"/>
-      <text class="ilab" x="891" y="392" text-anchor="middle">S3 · artifacts</text>
-      <text class="ilab2" x="891" y="407" text-anchor="middle">summary.json · xcresult</text>
+      <image href="./assets/aws/s3.png" x="842" y="316" width="58" height="58"/>
+      <text class="ilab" x="871" y="392" text-anchor="middle">S3 · artifacts</text>
+      <text class="ilab2" x="871" y="407" text-anchor="middle">summary.json · xcresult</text>
 
-      <!-- subnet contents -->
-      <image href="./assets/aws/codebuild.png" x="419" y="380" width="58" height="58"/>
-      <text class="ilab" x="448" y="456" text-anchor="middle">CodeBuild project</text>
-      <text class="ilab2" x="448" y="471" text-anchor="middle">ios-agent-tests</text>
-      <image href="./assets/aws/ec2.png" x="419" y="552" width="58" height="58"/>
-      <text class="ilab" x="448" y="628" text-anchor="middle">MAC_ARM fleet</text>
-      <text class="ilab2" x="448" y="643" text-anchor="middle">ios-agent-tests-mac</text>
+      <!-- subnet contents (CORE, inside optional VPC) -->
+      <image href="./assets/aws/codebuild.png" x="424" y="380" width="58" height="58"/>
+      <text class="ilab" x="453" y="456" text-anchor="middle">CodeBuild project</text>
+      <text class="cap" x="453" y="472" text-anchor="middle">cache: none·local·s3</text>
+      <image href="./assets/aws/ec2.png" x="424" y="552" width="58" height="58"/>
+      <text class="ilab" x="453" y="628" text-anchor="middle">MAC_ARM fleet</text>
+      <text class="cap" x="453" y="644" text-anchor="middle">1 shared · serves all apps</text>
 
       <!-- endpoints -->
-      <image href="./assets/aws/endpoint.png" x="689" y="388" width="40" height="40"/>
-      <text class="ilab2" x="709" y="442" text-anchor="middle">Amazon S3</text>
-      <image href="./assets/aws/endpoint.png" x="689" y="478" width="40" height="40"/>
-      <text class="ilab2" x="709" y="532" text-anchor="middle">CloudWatch Logs</text>
-      <image href="./assets/aws/endpoint.png" x="689" y="561" width="40" height="40"/>
-      <text class="ilab2" x="709" y="615" text-anchor="middle">AWS CodeBuild</text>
-
-      <!-- github (external) -->
-      <image href="./assets/aws/github.png" x="44" y="612" width="56" height="56"/>
-      <text class="ilab" x="72" y="684" text-anchor="middle">GitHub</text>
-      <text class="ilab2" x="72" y="699" text-anchor="middle">your iOS repo</text>
+      <image href="./assets/aws/endpoint.png" x="724" y="388" width="38" height="38"/>
+      <text class="ilab2" x="744" y="440" text-anchor="middle">Amazon S3</text>
+      <image href="./assets/aws/endpoint.png" x="724" y="476" width="38" height="38"/>
+      <text class="ilab2" x="744" y="528" text-anchor="middle">CloudWatch Logs</text>
+      <image href="./assets/aws/endpoint.png" x="724" y="560" width="38" height="38"/>
+      <text class="ilab2" x="744" y="612" text-anchor="middle">AWS CodeBuild</text>
     </svg>
     </div>
   </div>
