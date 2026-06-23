@@ -18,37 +18,11 @@ This repo is the **CDK v2 (TypeScript)** packaging of that system: one
 
 ## Architecture
 
-```
-                 ┌──────────────────────────────────────────────────────────┐
-   AI agent ───► │  Amazon Bedrock AgentCore Gateway   (AWS_IAM auth, MCP)    │
-  (SigV4 MCP)    │  target: lambda  +  inline tool schema (gateway-tools.json)│
-                 └───────────────────────────┬──────────────────────────────┘
-                                             │ assumes GatewayInvokeRole
-                                             ▼
-                 ┌──────────────────────────────────────────────────────────┐
-                 │  Lambda  codebuild-ios-mcp  (python3.12, 256MB, 30s)       │
-                 │  tools: ios_test · ios_build_status · list_schemes ·       │
-                 │         get_test_logs                                      │
-                 └───────┬───────────────────────────┬──────────────────────┘
-            StartBuild / │                            │ GetObject / ListBucket
-        BatchGetBuilds   │                            │ summary.json + presigned URLs
-                         ▼                            ▼
-        ┌────────────────────────────┐      ┌────────────────────────────────┐
-        │ CodeBuild project           │      │  S3 artifacts bucket            │
-        │  ios-agent-tests            │ ───► │  builds/<id>/ (14-day expiry)   │
-        │  buildspec embedded inline  │ logs │   summary.json (auth. results)  │
-        │  GITHUB source (your repo)  │      │   screenshots, xcresult.zip     │
-        └──────────────┬─────────────┘      │  schemes/<branch>.json          │
-                       │ runs on            │  tooling/xcresult_to_junit.py   │
-                       ▼                    └────────────────────────────────┘
-        ┌────────────────────────────┐
-        │ MAC_ARM reserved fleet      │   Structured pass/fail comes from
-        │  ios-agent-tests-mac        │   summary.json (written by the buildspec
-        │  BUILD_GENERAL1_MEDIUM      │   from the .xcresult), NOT CodeBuild's
-        │  baseCapacity 1, QUEUE      │   Test Reports API — its JUnit parser
-        └────────────────────────────┘   silently drops cases. A JUnit report is
-                                          still emitted for the console view.
-```
+![codebuild-ios-mcp architecture](docs/architecture.png)
+
+> Interactive source: [`docs/architecture.html`](docs/architecture.html). Solid orange
+> is the required core path (including code + artifact movement); dashed purple is the
+> optional VPC / private-network add-on.
 
 What `cdk deploy` creates:
 
