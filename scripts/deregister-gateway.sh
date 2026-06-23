@@ -38,6 +38,15 @@ fi
 }
 echo "GatewayId=$GATEWAY_ID"
 
+# Guard: keeping a shared gateway means deleting exactly one target. Without
+# TARGET_ID the else-branch below would bulk-delete EVERY target (siblings
+# included) before the KEEP_GATEWAY guard runs — defeating the point. Fail fast.
+if [ -n "$KEEP_GATEWAY" ] && [ -z "$TARGET_ID" ]; then
+  echo "KEEP_GATEWAY is set but TARGET_ID is not. Refusing to bulk-delete targets" >&2
+  echo "on a shared gateway. Set TARGET_ID=<id> to remove only this stack's target." >&2
+  exit 1
+fi
+
 if [ -n "$TARGET_ID" ]; then
   # Targeted delete — only this one target. Used for shared gateways.
   echo "Deleting target $TARGET_ID..."
