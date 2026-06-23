@@ -152,6 +152,28 @@ npx cdk deploy \
 `register-gateway.sh` prints the `GATEWAY_ID`, `GATEWAY_ARN`, `GATEWAY_URL`, and
 `TARGET_ID`. Agents connect to `GATEWAY_URL` over MCP using SigV4 (`AWS_IAM`).
 
+### Reuse an existing gateway (one gateway, many targets)
+
+By default the script creates a dedicated gateway. If you already run an
+AgentCore Gateway and want an agent to see these iOS tools alongside its other
+tools at a single MCP URL, register this stack's Lambda as a target on that
+gateway instead:
+
+```bash
+EXISTING_GATEWAY_ID=<your-gateway-id> ./scripts/register-gateway.sh
+```
+
+It skips `create-gateway` and adds only the lambda target. One caveat: gateway
+targets invoke the Lambda with the **gateway's own** `GATEWAY_IAM_ROLE`, so this
+stack's `GatewayInvokeRole` is bypassed — grant the existing gateway's role
+`lambda:InvokeFunction` on the `LambdaArn` the script prints, or calls fail with
+`AccessDenied`. To remove just this target later (leaving the shared gateway and
+any sibling targets intact):
+
+```bash
+KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregister-gateway.sh
+```
+
 ---
 
 ## How an agent uses it

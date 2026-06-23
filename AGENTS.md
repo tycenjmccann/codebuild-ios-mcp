@@ -46,6 +46,14 @@ npx cdk deploy -c codebuild-ios-mcp:githubRepo=<repo> -c codebuild-ios-mcp:proje
 ./scripts/register-gateway.sh                      # creates gateway + target (no IaC for it yet)
 ```
 
+Reuse an existing gateway (one gateway, many tool stacks → one MCP URL for the
+agent) instead of creating a dedicated one:
+`EXISTING_GATEWAY_ID=<gw-id> ./scripts/register-gateway.sh`. It adds only a lambda
+target. Because targets use GATEWAY_IAM_ROLE creds, grant the EXISTING gateway's
+role `lambda:InvokeFunction` on this stack's Lambda ARN (the script prints it),
+else tool calls AccessDenied. Tear down just the target with
+`KEEP_GATEWAY=1 TARGET_ID=<id> GATEWAY_ID=<gw> ./scripts/deregister-gateway.sh`.
+
 Private repo: `aws codebuild import-source-credentials --server-type GITHUB
 --auth-type PERSONAL_ACCESS_TOKEN --token <pat>` once per account/region first.
 
