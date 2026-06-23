@@ -29,11 +29,12 @@
   .datakey .sw{flex:none;width:22px;margin-top:9px}
   .datakey .sw svg{border:0;width:22px;height:8px}
   .datakey .t{font-size:13px;color:var(--muted);line-height:1.45}
-  .cost{margin-top:18px;padding:12px 13px;background:#fff8 ;border:1px solid #f0d9a8;border-radius:9px;
+  .cost{margin-top:18px;padding:12px 13px;border:1px solid #f0d9a8;border-radius:9px;
     background:#fffaf0;font-size:12.5px;line-height:1.5;color:#7a5a16}
   .cost b{color:#b3741e}
-  .meta{margin-top:14px;font-size:12px;color:var(--muted);line-height:1.6}
-  .meta b{color:var(--ink)} .meta code{font-family:var(--mono);font-size:11.5px}
+  .poll{margin-top:18px;padding:12px 13px;border:1px solid #cfe3f2;border-radius:9px;
+    background:#f3f9fd;font-size:12.5px;line-height:1.55;color:#33576f}
+  .poll b{color:#1d6291} .poll code{font-family:var(--mono);font-size:11px;color:#1d6291}
 </style>
 </head>
 <body>
@@ -48,7 +49,7 @@
       <h2>Control flow</h2>
       <div class="step"><div class="n">1</div><div class="t"><b>Agent → Gateway</b><br><span>SigV4-signed MCP over HTTPS (AWS_IAM auth)</span></div></div>
       <div class="step"><div class="n">2</div><div class="t"><b>Gateway → Lambda</b><br><span>assumes GatewayInvokeRole, invokes the tool handler</span></div></div>
-      <div class="step"><div class="n">3</div><div class="t"><b>Lambda → CodeBuild</b><br><span>StartBuild on the macOS fleet; reads <code>summary.json</code> + presigned URLs back from S3</span></div></div>
+      <div class="step"><div class="n">3</div><div class="t"><b>Lambda ⇄ CodeBuild</b> <span>(poll)</span><br><span><code>ios_test</code> starts the build; the agent loops <code>ios_build_status</code> until done, then reads <code>summary.json</code> + presigned URLs from S3</span></div></div>
       <div class="step"><div class="n">4</div><div class="t"><b>Build → internal</b><br><span>fleet reaches your Nexus &amp; validation services over the private path</span></div></div>
 
       <div class="datakey">
@@ -56,14 +57,17 @@
         <div class="t"><b style="color:var(--ink)">Dashed</b> = data / artifact paths: build source (git clone), artifact upload to S3, and AWS API access via VPC endpoints.</div>
       </div>
 
-      <div class="cost"><b>⚠ Cost:</b> the MAC_ARM reserved fleet bills continuously (~$25–30/day per instance, ~24 h minimum lease). Tear it down when idle.</div>
-
-      <div class="meta">
-        <b>Outside the VPC by design:</b> Amazon S3 is a regional service, reached privately through its
-        gateway endpoint. <b>Nexus &amp; validation services</b> are your own infra (on-prem or a shared
-        VPC), not deployed by this stack.<br><br>
-        <b>Gateway</b> is created by <code>register-gateway.sh</code> (no IaC resource yet).
+      <div class="poll">
+        <b>How the agent learns the result</b><br>
+        Polling, not push. Each MCP call is a synchronous round-trip.
+        <code>ios_test</code> returns a <code>build_id</code> immediately, then the
+        agent calls <code>ios_build_status(build_id)</code> on a loop until
+        <code>status</code> leaves <code>IN_PROGRESS</code> →
+        <code>SUCCEEDED</code> / <code>FAILED</code> / <code>BUILD_ERROR</code> /
+        <code>TIMED_OUT</code>.
       </div>
+
+      <div class="cost"><b>⚠ Cost:</b> the MAC_ARM reserved fleet bills continuously (~$25–30/day per instance, ~24 h minimum lease). Tear it down when idle.</div>
     </aside>
 
     <!-- ============ RIGHT: diagram ============ -->
@@ -74,6 +78,8 @@
           <path d="M0,0 L9,5 L0,10 z" fill="#ec7211"/></marker>
         <marker id="ar--data" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto">
           <path d="M0,0 L9,5 L0,10 z" fill="#6b7785"/></marker>
+        <marker id="ar--flowR" markerWidth="10" markerHeight="10" refX="1.5" refY="5" orient="auto">
+          <path d="M9,0 L0,5 L9,10 z" fill="#ec7211"/></marker>
         <style>
           .flow{stroke:#ec7211;stroke-width:2.2;fill:none}
           .data{stroke:#6b7785;stroke-width:1.6;fill:none;stroke-dasharray:6 4}
@@ -116,17 +122,21 @@
       <text class="ilab" x="790" y="926" text-anchor="middle">Internal validation services</text>
       <text class="ilab2" x="790" y="945" text-anchor="middle">test-time: private APIs &amp; tools</text>
 
-      <!-- ============ FLOW ARROWS (numbers only) ============ -->
-      <!-- 1 agent -> gateway -->
-      <path class="flow" d="M266,176 H368" marker-end="url(#ar--flow)"/>
+      <!-- ============ FLOW ARROWS (round-trip: each call returns a response) ============ -->
+      <!-- 1 agent <-> gateway -->
+      <path class="flow" d="M268,176 H366" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="305" cy="176" r="10" fill="#ec7211"/><text class="num" x="305" y="180" text-anchor="middle">1</text>
-      <!-- 2 gateway -> lambda -->
-      <path class="flow" d="M434,176 H544" marker-end="url(#ar--flow)"/>
+      <!-- 2 gateway <-> lambda -->
+      <path class="flow" d="M436,176 H542" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="489" cy="176" r="10" fill="#ec7211"/><text class="num" x="489" y="180" text-anchor="middle">2</text>
-      <!-- 3 lambda -> codebuild -->
-      <path class="flow" d="M573,206 V256 H448 V380" marker-end="url(#ar--flow)"/>
+      <!-- 3 lambda <-> codebuild : StartBuild + repeated poll (round-trip) -->
+      <path class="flow" d="M573,206 V256 H448 V378" marker-start="url(#ar--flowR)" marker-end="url(#ar--flow)"/>
       <circle cx="510" cy="256" r="10" fill="#ec7211"/><text class="num" x="510" y="260" text-anchor="middle">3</text>
-      <!-- 4 fleet -> corporate : exit subnet at bottom edge, avoid the label -->
+      <!-- poll-loop glyph on leg 3 -->
+      <path d="M474,300 a13,13 0 1 1 -9,4" fill="none" stroke="#ec7211" stroke-width="1.8"/>
+      <path d="M465,304 l0,-8 l8,2 z" fill="#ec7211"/>
+      <text class="ilab2" x="492" y="312" fill="#9a4f00" style="font-family:ui-monospace,monospace;font-size:10px">poll</text>
+      <!-- 4 fleet -> corporate (one-way: build reaches internal infra) -->
       <path class="flow" d="M540,581 H560 V850" marker-end="url(#ar--flow)"/>
       <circle cx="560" cy="784" r="10" fill="#ec7211"/><text class="num" x="560" y="788" text-anchor="middle">4</text>
 
