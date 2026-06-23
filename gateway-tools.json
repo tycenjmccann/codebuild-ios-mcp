@@ -52,7 +52,19 @@
   },
   {
     "name": "get_build_log",
-    "description": "Get the raw build output for a build, including builds that FAILED BEFORE any test ran (compile error, dependency resolution failure, scheme or simulator not found, bad project_dir). Returns error_tail (the error: lines plus the last ~100 log lines) and a presigned URL to the full build_output.log. Use this when ios_build_status returns status BUILD_ERROR or a test_summary with total 0 (get_test_logs cannot help there, since it keys off named test failures that do not exist).",
+    "description": "Get build output for a build. While the build is IN_PROGRESS, returns a live_tail of the most recent CloudWatch log lines (real-time progress, before any S3 upload). When the build has finished, returns error_tail (the error: lines plus the last ~100 log lines) and a presigned URL to the full build_output.log. Use this to watch progress mid-build, and whenever ios_build_status returns BUILD_ERROR or a test_summary with total 0 (get_test_logs cannot help there, since it keys off named test failures that do not exist).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "build_id": { "type": "string", "description": "CodeBuild build id returned by ios_test" },
+        "lines": { "type": "integer", "description": "How many recent log lines to return for the live tail (default 100, max 500)" }
+      },
+      "required": ["build_id"]
+    }
+  },
+  {
+    "name": "ios_cancel",
+    "description": "Stop a running build (CodeBuild StopBuild). Use to abort a wrong or runaway build and free the macOS fleet instead of waiting out the 40-minute timeout. No-op with a clear message if the build has already finished.",
     "inputSchema": {
       "type": "object",
       "properties": {

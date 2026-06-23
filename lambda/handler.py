@@ -1,7 +1,7 @@
 """codebuild-ios-mcp — AgentCore Gateway Lambda target.
 
-Hosts five MCP tools (ios_test, ios_build_status, list_schemes, get_test_logs,
-get_build_log) behind a single Lambda. AgentCore Gateway invokes it per tool
+Hosts six MCP tools (ios_test, ios_build_status, list_schemes, get_test_logs,
+get_build_log, ios_cancel) behind a single Lambda. Gateway invokes it per tool
 call, passing the tool name in the client context and the tool arguments as the
 event payload.
 
@@ -79,10 +79,12 @@ def ios_build_status(args: dict) -> dict:
                 "build_errors": [f"No build found for id {build_id}"]}
     build = builds[0]
     cb_status = build["buildStatus"]  # IN_PROGRESS | SUCCEEDED | FAILED | FAULT | STOPPED | TIMED_OUT
+    phases = _phase_timeline(build)
 
     if cb_status == "IN_PROGRESS":
         return {"status": "IN_PROGRESS", "build_id": build_id,
-                "current_phase": build.get("currentPhase", "")}
+                "current_phase": build.get("currentPhase", ""),
+                "phases": phases}
 
     duration = _duration(build)
     summary, failures = _get_test_results(build_id)
@@ -111,6 +113,7 @@ def ios_build_status(args: dict) -> dict:
         "failures": failures,
         "artifacts": artifacts,
         "build_errors": build_errors,
+        "phases": phases,
     }
 
 
@@ -163,6 +166,23 @@ def get_test_logs(args: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def get_build_log(args: dict) -> dict:
     build_id = args["build_id"]
+    # Live tail: while the build is running, the final build_output.log/error_tail
+    # don't exist yet, so read the tail of the CloudWatch log stream directly. This
+    # turns the poll loop into real progress instead of an opaque wait.
+    builds = codebuild.batch_get_builds(ids=[build_id]).get("builds", [])
+    build = builds[0] if builds else {}
+    is_running = build.get("buildStatus") == "IN_PROGRESS"
+    if is_running:
+        live = _tail_cloudwatch(build, int(args.get("lines", 100)))
+        return {
+            "build_id": build_id,
+            "status": "IN_PROGRESS",
+            "current_phase": build.get("currentPhase", ""),
+            "live_tail": live,      # most recent CloudWatch log lines, live
+            "full_log_url": "",     # not uploaded to S3 until the build ends
+        }
+
+    # Completed: serve the focused error tail + presigned full log from S3.
     tail = _get_error_tail(build_id)
     prefix = f"builds/{build_id}"
     full_log_url = ""
@@ -176,14 +196,37 @@ def get_build_log(args: dict) -> dict:
     except Exception:
         pass
     if not tail and not full_log_url:
-        return {"build_id": build_id, "error_tail": "", "full_log_url": "",
-                "message": "No build log found yet. The build may still be "
-                           "running, or it failed before the diagnostics step."}
+        # Build ended but diagnostics never uploaded (e.g. killed in PROVISIONING).
+        # Fall back to whatever CloudWatch captured.
+        live = _tail_cloudwatch(build, int(args.get("lines", 100)))
+        return {"build_id": build_id, "error_tail": live, "full_log_url": "",
+                "message": "No S3 build log; showing CloudWatch tail instead."}
     return {
         "build_id": build_id,
         "error_tail": tail,        # error: lines + last 100 log lines
         "full_log_url": full_log_url,  # presigned full build_output.log
     }
+
+
+# --------------------------------------------------------------------------- #
+# Tool: ios_cancel — stop a running build (StopBuild). Frees the warm fleet when
+# the agent realizes a build is wrong/runaway instead of waiting out the 40-min
+# timeout. No-op (with a clear message) if the build already finished.
+# --------------------------------------------------------------------------- #
+def ios_cancel(args: dict) -> dict:
+    build_id = args["build_id"]
+    builds = codebuild.batch_get_builds(ids=[build_id]).get("builds", [])
+    if not builds:
+        return {"build_id": build_id, "stopped": False,
+                "message": f"No build found for id {build_id}."}
+    if builds[0].get("buildStatus") != "IN_PROGRESS":
+        return {"build_id": build_id, "stopped": False,
+                "status": builds[0].get("buildStatus"),
+                "message": "Build already finished; nothing to stop."}
+    resp = codebuild.stop_build(id=build_id)
+    return {"build_id": build_id, "stopped": True,
+            "status": resp.get("build", {}).get("buildStatus", "STOPPED"),
+            "message": "Stop requested."}
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +238,54 @@ def _duration(build: dict) -> int:
     if start and end:
         return int(end.timestamp() - start.timestamp())
     return 0
+
+
+def _phase_timeline(build: dict):
+    """Flatten CodeBuild's phases[] into a compact, agent-friendly timeline.
+
+    Every build moves SUBMITTED -> QUEUED -> PROVISIONING -> DOWNLOAD_SOURCE ->
+    INSTALL -> PRE_BUILD -> BUILD -> POST_BUILD -> UPLOAD_ARTIFACTS -> FINALIZING.
+    Returning this lets the agent see WHERE a slow build is (e.g. stuck cloning vs
+    compiling) and which phase failed, with per-phase durations.
+    """
+    out = []
+    for p in build.get("phases", []):
+        ptype = p.get("phaseType", "")
+        item = {
+            "phase": ptype,
+            "status": p.get("phaseStatus", "IN_PROGRESS"),
+            "duration_seconds": p.get("durationInSeconds", 0),
+        }
+        contexts = [c.get("message") for c in p.get("contexts", []) if c.get("message")]
+        if contexts:
+            item["context"] = "; ".join(contexts)
+        out.append(item)
+    return out
+
+
+def _tail_cloudwatch(build: dict, lines: int = 100) -> str:
+    """Return the most recent CloudWatch log lines for a build, live.
+
+    CodeBuild streams logs in real time; the build's logs.groupName/streamName
+    point at them. We read the tail so an agent polling mid-build sees progress
+    instead of waiting for the end-of-build S3 upload.
+    """
+    info = build.get("logs", {}) or {}
+    group = info.get("groupName")
+    stream = info.get("streamName")
+    if not group or not stream:
+        return ""
+    lines = max(1, min(int(lines), 500))
+    try:
+        resp = logs.get_log_events(
+            logGroupName=group,
+            logStreamName=stream,
+            limit=lines,
+            startFromHead=False,
+        )
+        return "".join(e.get("message", "") for e in resp.get("events", [])).strip()
+    except Exception as e:
+        return f"(could not read CloudWatch logs: {e})"
 
 
 def _get_test_results(build_id: str):
@@ -297,6 +388,7 @@ TOOLS = {
     "list_schemes": list_schemes,
     "get_test_logs": get_test_logs,
     "get_build_log": get_build_log,
+    "ios_cancel": ios_cancel,
 }
 
 

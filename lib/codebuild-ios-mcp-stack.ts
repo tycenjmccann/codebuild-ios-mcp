@@ -357,7 +357,7 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')),
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
-      description: 'codebuild-ios-mcp tool dispatcher (ios_test, ios_build_status, list_schemes, get_test_logs).',
+      description: 'codebuild-ios-mcp tool dispatcher (ios_test, ios_build_status, list_schemes, get_test_logs, get_build_log, ios_cancel).',
       environment: {
         CODEBUILD_PROJECT: project.projectName,
         ARTIFACTS_BUCKET: artifactsBucket.bucketName,
@@ -372,8 +372,18 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'CodeBuildRunAndRead',
-        actions: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds'],
+        // StopBuild powers ios_cancel; BatchGetBuilds powers status + phase timeline.
+        actions: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds', 'codebuild:StopBuild'],
         resources: [project.projectArn],
+      }),
+    );
+    // Live log tail (get_build_log while IN_PROGRESS) reads the project's
+    // CloudWatch log stream directly. Scoped to this project's log group.
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadBuildLogs',
+        actions: ['logs:GetLogEvents'],
+        resources: [`${codeBuildLogGroup.logGroupArn}:*`],
       }),
     );
     artifactsBucket.grantRead(fn);

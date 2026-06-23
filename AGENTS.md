@@ -6,13 +6,15 @@ detail lives in `README.md`; this file is the terse, do-this sequence.
 ## What this is
 
 A CDK v2 (TypeScript) app that provisions an AWS CodeBuild **macOS (`MAC_ARM`)**
-iOS build+test runner and exposes it to agents as five MCP tools through a
+iOS build+test runner and exposes it to agents as six MCP tools through a
 Bedrock AgentCore Gateway: `ios_test`, `ios_build_status`, `list_schemes`,
-`get_test_logs`, `get_build_log`. Async contract: `ios_test` returns a
-`build_id`; poll `ios_build_status` until `status != "IN_PROGRESS"`. When a build
-fails before tests run (`BUILD_ERROR` / `test_summary.total == 0`),
-`get_build_log` surfaces the raw xcodebuild/clone/dep error that `get_test_logs`
-can't (it keys off named test failures).
+`get_test_logs`, `get_build_log`, `ios_cancel`. Async contract: `ios_test`
+returns a `build_id`; poll `ios_build_status` until `status != "IN_PROGRESS"`
+(every status response carries a `phases[]` timeline). When a build fails before
+tests run (`BUILD_ERROR` / `test_summary.total == 0`), `get_build_log` surfaces
+the raw xcodebuild/clone/dep error that `get_test_logs` can't (it keys off named
+test failures); while a build runs it returns a live CloudWatch log tail.
+`ios_cancel` stops a runaway build (`StopBuild`).
 
 ## Hard constraints (do not violate)
 
@@ -31,7 +33,7 @@ can't (it keys off named test failures).
 - `buildspec.yaml` — build behavior. Read at synth time and embedded inline into
   the project; the iOS repo under test needs no buildspec. One shell block on
   purpose (CodeBuild runs each list item in a fresh CWD). Edit + redeploy.
-- `lambda/handler.py` — the five tools. Structured results are read from
+- `lambda/handler.py` — the six tools. Structured results are read from
   `s3://<bucket>/builds/<id>/summary.json`, NOT the CodeBuild Test Reports API
   (its JUnit parser silently drops cases). Keep this. Pre-test failures surface
   via `error_tail.txt` / `build_output.log` (also in `builds/<id>/`), read by
