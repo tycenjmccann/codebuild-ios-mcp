@@ -15,7 +15,7 @@ architecture, deploy steps, and cost warning.
 |------|------|
 | `bin/app.ts` | CDK app entrypoint; reads context, instantiates the stack |
 | `lib/codebuild-ios-mcp-stack.ts` | The stack: S3 bucket, MAC_ARM fleet, CodeBuild project, Lambda, gateway invoke role, outputs |
-| `lambda/handler.py` | The four MCP tools (`ios_test`, `ios_build_status`, `list_schemes`, `get_test_logs`) |
+| `lambda/handler.py` | The five MCP tools (`ios_test`, `ios_build_status`, `list_schemes`, `get_test_logs`, `get_build_log`) |
 | `tooling/xcresult_to_junit.py` | xcresult to JUnit converter, deployed to `s3://<bucket>/tooling/` |
 | `buildspec.yaml` | Embedded inline into the CodeBuild project — single source of truth for build behavior |
 | `gateway-tools.json` | Inline tool schema for the Gateway lambda target |

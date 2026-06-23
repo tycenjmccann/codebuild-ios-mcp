@@ -1,7 +1,7 @@
 """codebuild-ios-mcp — AgentCore Gateway Lambda target.
 
-Hosts four MCP tools (ios_test, ios_build_status, list_schemes, get_test_logs)
-behind a single Lambda. AgentCore Gateway invokes this function once per tool
+Hosts five MCP tools (ios_test, ios_build_status, list_schemes, get_test_logs,
+get_build_log) behind a single Lambda. AgentCore Gateway invokes it per tool
 call, passing the tool name in the client context and the tool arguments as the
 event payload.
 
@@ -91,8 +91,15 @@ def ios_build_status(args: dict) -> dict:
     build_errors = []
     status = "SUCCEEDED" if cb_status == "SUCCEEDED" else "FAILED"
     if status == "FAILED" and summary["total"] == 0:
+        # Build failed before any test ran. Surface the real cause: CodeBuild
+        # phase contexts (e.g. exit 65) PLUS the captured error tail from the
+        # build log, so the agent gets actual xcodebuild/clone/dep errors and
+        # not just "COMMAND_EXECUTION: exit status 65".
         build_errors = _extract_build_errors(build)
-        status = "BUILD_ERROR" if build_errors else "FAILED"
+        tail = _get_error_tail(build_id)
+        if tail:
+            build_errors.append(tail)
+        status = "BUILD_ERROR"
     if cb_status == "TIMED_OUT":
         status = "TIMED_OUT"
 
@@ -145,6 +152,37 @@ def get_test_logs(args: dict) -> dict:
         "full_output": match["message"],
         "duration_ms": match["duration_ms"],
         "screenshots": screenshots,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Tool: get_build_log — raw build output for ANY build, including ones that
+# failed before tests ran (compile error, dep resolution, scheme/sim not found,
+# bad project_dir). This is the escape hatch get_test_logs can't cover: it keys
+# off named test failures, which don't exist when the build never reached tests.
+# --------------------------------------------------------------------------- #
+def get_build_log(args: dict) -> dict:
+    build_id = args["build_id"]
+    tail = _get_error_tail(build_id)
+    prefix = f"builds/{build_id}"
+    full_log_url = ""
+    try:
+        s3.head_object(Bucket=BUCKET, Key=f"{prefix}/build_output.log")
+        full_log_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": f"{prefix}/build_output.log"},
+            ExpiresIn=PRESIGN_TTL,
+        )
+    except Exception:
+        pass
+    if not tail and not full_log_url:
+        return {"build_id": build_id, "error_tail": "", "full_log_url": "",
+                "message": "No build log found yet. The build may still be "
+                           "running, or it failed before the diagnostics step."}
+    return {
+        "build_id": build_id,
+        "error_tail": tail,        # error: lines + last 100 log lines
+        "full_log_url": full_log_url,  # presigned full build_output.log
     }
 
 
@@ -208,11 +246,35 @@ def _get_artifact_urls(build_id: str) -> dict:
         pass
     logs_url = (f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region="
                 f"{REGION}#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252F{PROJECT}")
+    build_log_url = ""
+    try:
+        s3.head_object(Bucket=BUCKET, Key=f"{prefix}/build_output.log")
+        build_log_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": f"{prefix}/build_output.log"},
+            ExpiresIn=PRESIGN_TTL,
+        )
+    except Exception:
+        pass
     return {
         "xcresult_url": xcresult_url,
         "screenshots": _list_presigned(f"{prefix}/screenshots/"),
         "logs_url": logs_url,
+        "build_log_url": build_log_url,
     }
+
+
+def _get_error_tail(build_id: str, limit: int = 6000) -> str:
+    """Read the focused error tail the buildspec wrote (error: lines + last
+    100 log lines). Present even when the build failed before any test ran."""
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=f"builds/{build_id}/error_tail.txt")
+        text = obj["Body"].read().decode("utf-8", "replace").strip()
+        return text[-limit:] if len(text) > limit else text
+    except s3.exceptions.NoSuchKey:
+        return ""
+    except Exception as e:
+        return f"(could not read error_tail.txt: {e})"
 
 
 def _extract_build_errors(build: dict):
@@ -234,6 +296,7 @@ TOOLS = {
     "ios_build_status": ios_build_status,
     "list_schemes": list_schemes,
     "get_test_logs": get_test_logs,
+    "get_build_log": get_build_log,
 }
 
 

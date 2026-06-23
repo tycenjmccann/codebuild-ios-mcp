@@ -55,7 +55,7 @@
 <body>
 <div class="wrap">
   <h1><span class="m">codebuild-ios-mcp</span> · AWS Architecture</h1>
-  <p class="sub">AI agents build and test iOS apps on AWS CodeBuild macOS through four MCP tools, exposed via a
+  <p class="sub">AI agents build and test iOS apps on AWS CodeBuild macOS through five MCP tools, exposed via a
      Bedrock AgentCore Gateway.</p>
 
   <div class="layout">
@@ -104,6 +104,7 @@
         <div class="tool"><b>ios_build_status</b><span>Get a run's status and results by <code>build_id</code>: pass/fail counts, failing tests, and artifact links.</span></div>
         <div class="tool"><b>list_schemes</b><span>List the schemes available on a branch so the agent can pick the right one.</span></div>
         <div class="tool"><b>get_test_logs</b><span>Get the detailed log and screenshot for a single failing test.</span></div>
+        <div class="tool"><b>get_build_log</b><span>Get the raw build output when a build fails before tests run (compile or dependency errors).</span></div>
       </div>
 
       <div class="cost"><b>⚠ Cost:</b> the macOS build machine bills continuously while it exists (~$25–30/day, ~24 h minimum). Tear it down when idle.</div>

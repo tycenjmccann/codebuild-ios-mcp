@@ -23,71 +23,111 @@ phases:
         # No global `set -e`: scheme/device probing uses commands that return
         # nonzero on "no match" (ls, grep), which would abort the run before
         # xcodebuild ever ran. We capture the test exit code explicitly instead.
-        BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
-        BRANCH="${BRANCH##refs/heads/}"
-        cd "$CODEBUILD_SRC_DIR/$PROJECT_DIR" || { echo "PROJECT_DIR '$PROJECT_DIR' not found"; exit 1; }
+        #
+        # ALL output (probing, dep resolve, compile, test) is tee'd to a single
+        # build_output.log, and that log + an error_tail.txt are ALWAYS uploaded
+        # to builds/<id>/ — even when the build fails before any test runs (bad
+        # PROJECT_DIR, scheme not found, compile/dep error). That is the contract
+        # the get_build_log tool reads, so the agent always sees the raw error.
+        LOG="$CODEBUILD_SRC_DIR/build_output.log"
 
-        # --- pick container: workspace beats project (globs may not match) ---
-        WS=""; PROJ=""
-        for f in *.xcworkspace; do [ -e "$f" ] && WS="$f" && break; done
-        for f in *.xcodeproj;   do [ -e "$f" ] && PROJ="$f" && break; done
-        if [ -n "$WS" ]; then CONTAINER=(-workspace "$WS"); else CONTAINER=(-project "$PROJ"); fi
-        echo "Container: ${CONTAINER[*]}"
+        # Everything below runs inside run() so we can pipe the whole thing to
+        # tee and still recover the real exit code via PIPESTATUS. Use `return`
+        # (never `exit`) inside run() so diagnostics upload regardless.
+        run() {
+          BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
+          BRANCH="${BRANCH##refs/heads/}"
+          cd "$CODEBUILD_SRC_DIR/$PROJECT_DIR" || { echo "ERROR: PROJECT_DIR '$PROJECT_DIR' not found under $CODEBUILD_SRC_DIR"; return 1; }
 
-        # --- publish scheme manifest for the list_schemes tool ---
-        LIST_JSON=$(xcodebuild "${CONTAINER[@]}" -list -json 2>/dev/null || echo '{}')
-        echo "$LIST_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin) or {}; k='workspace' if 'workspace' in d else ('project' if 'project' in d else None); s=(d.get(k,{}).get('schemes') if k else []) or []; print(json.dumps({'schemes': s, 'default_scheme': s[0] if s else ''}))" > schemes.json
-        aws s3 cp schemes.json "s3://$ARTIFACTS_BUCKET/schemes/$BRANCH.json" || true
-        [ -z "$SCHEME" ] && SCHEME=$(python3 -c "import json;print(json.load(open('schemes.json'))['default_scheme'])")
-        echo "Using scheme: $SCHEME"
+          # --- pick container: workspace beats project (globs may not match) ---
+          WS=""; PROJ=""
+          for f in *.xcworkspace; do [ -e "$f" ] && WS="$f" && break; done
+          for f in *.xcodeproj;   do [ -e "$f" ] && PROJ="$f" && break; done
+          if [ -z "$WS" ] && [ -z "$PROJ" ]; then echo "ERROR: no .xcworkspace or .xcodeproj found in $(pwd)"; return 1; fi
+          if [ -n "$WS" ]; then CONTAINER=(-workspace "$WS"); else CONTAINER=(-project "$PROJ"); fi
+          echo "Container: ${CONTAINER[*]}"
 
-        # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
-        DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-        if [ -z "$DEST_ID" ]; then
-          echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
-          DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-        fi
-        xcrun simctl boot "$DEST_ID" || true
+          # --- publish scheme manifest for the list_schemes tool ---
+          LIST_JSON=$(xcodebuild "${CONTAINER[@]}" -list -json 2>/dev/null || echo '{}')
+          echo "$LIST_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin) or {}; k='workspace' if 'workspace' in d else ('project' if 'project' in d else None); s=(d.get(k,{}).get('schemes') if k else []) or []; print(json.dumps({'schemes': s, 'default_scheme': s[0] if s else ''}))" > schemes.json
+          aws s3 cp schemes.json "s3://$ARTIFACTS_BUCKET/schemes/$BRANCH.json" || true
+          [ -z "$SCHEME" ] && SCHEME=$(python3 -c "import json;print(json.load(open('schemes.json'))['default_scheme'])")
+          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme given and none auto-detected (shared schemes: $(python3 -c "import json;print(json.load(open('schemes.json'))['schemes'])" 2>/dev/null))"; return 1; fi
+          echo "Using scheme: $SCHEME"
 
-        # --- build cache: reuse DerivedData across builds when enabled ---
-        # CACHE_MODE local/s3 -> point DerivedData at a cached dir so only changed
-        # files recompile on the next run (the tight fix->retest loop). The paths
-        # in this file's `cache:` block are what CodeBuild persists.
-        DERIVED_ARGS=()
-        if [ "$CACHE_MODE" != "none" ]; then
-          DERIVED="/tmp/ios-mcp-cache/DerivedData"
-          mkdir -p "$DERIVED"
-          DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-          echo "Cache mode: $CACHE_MODE -> $DERIVED"
-        fi
+          # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
+          DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          if [ -z "$DEST_ID" ]; then
+            echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
+            DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          fi
+          [ -z "$DEST_ID" ] && { echo "ERROR: no iPhone simulator available"; return 1; }
+          xcrun simctl boot "$DEST_ID" || true
 
-        # --- resolve deps, then test ---
-        xcodebuild "${CONTAINER[@]}" -resolvePackageDependencies -scheme "$SCHEME" "${DERIVED_ARGS[@]}" || true
-        TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
-        set +e
-        xcodebuild test \
-          "${CONTAINER[@]}" \
-          -scheme "$SCHEME" \
-          -destination "id=$DEST_ID" \
-          -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
-          "${TESTPLAN_ARG[@]}" \
-          "${DERIVED_ARGS[@]}" \
-          -enableCodeCoverage YES \
-          2>&1 | tee "$CODEBUILD_SRC_DIR/build_output.log"
+          # --- build cache: reuse DerivedData across builds when enabled ---
+          # CACHE_MODE local/s3 -> point DerivedData at a cached dir so only changed
+          # files recompile on the next run (the tight fix->retest loop). The paths
+          # in this file's `cache:` block are what CodeBuild persists.
+          DERIVED_ARGS=()
+          if [ "$CACHE_MODE" != "none" ]; then
+            DERIVED="/tmp/ios-mcp-cache/DerivedData"
+            mkdir -p "$DERIVED"
+            DERIVED_ARGS=(-derivedDataPath "$DERIVED")
+            echo "Cache mode: $CACHE_MODE -> $DERIVED"
+          fi
+
+          # --- resolve deps (surface failures; do not swallow), then test ---
+          echo "=== resolvePackageDependencies ==="
+          if ! xcodebuild "${CONTAINER[@]}" -resolvePackageDependencies -scheme "$SCHEME" "${DERIVED_ARGS[@]}"; then
+            echo "ERROR: package dependency resolution failed (see above)"; return 65
+          fi
+          TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
+          echo "=== xcodebuild test ==="
+          xcodebuild test \
+            "${CONTAINER[@]}" \
+            -scheme "$SCHEME" \
+            -destination "id=$DEST_ID" \
+            -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
+            "${TESTPLAN_ARG[@]}" \
+            "${DERIVED_ARGS[@]}" \
+            -enableCodeCoverage YES
+          return ${PIPESTATUS[0]}
+        }
+
+        run 2>&1 | tee "$LOG"
         TEST_RC=${PIPESTATUS[0]}
-        set -e
 
-        # --- artifacts: screenshot + xcresult zip to S3 ---
+        # --- diagnostics: ALWAYS upload the raw log + a focused error tail, so a
+        #     build that fails before tests still surfaces its real error via the
+        #     get_build_log tool / ios_build_status build_errors. ---
+        {
+          echo "=== error / failure lines ===";
+          grep -nE 'error:|fatal error|\*\* (BUILD|TEST|CLEAN) FAILED|xcodebuild: error|Code=|No such|not found|Unable to|Could not|Testing cancelled|Linker command failed' "$LOG" | tail -120;
+          echo; echo "=== last 100 lines ==="; tail -100 "$LOG";
+        } > "$CODEBUILD_SRC_DIR/error_tail.txt" 2>/dev/null || true
+        aws s3 cp "$LOG" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/build_output.log" || true
+        aws s3 cp "$CODEBUILD_SRC_DIR/error_tail.txt" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/error_tail.txt" || true
+
+        # --- artifacts: screenshot + xcresult zip to S3 (best-effort) ---
         cd "$CODEBUILD_SRC_DIR"
-        xcrun simctl io "$DEST_ID" screenshot screenshot_final.png || true
-        aws s3 cp screenshot_final.png "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
-        ditto -c -k --sequesterRsrc --keepParent TestResults.xcresult TestResults.xcresult.zip || true
-        aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
+        [ -n "$DEST_ID" ] && xcrun simctl io "$DEST_ID" screenshot screenshot_final.png || true
+        [ -f screenshot_final.png ] && aws s3 cp screenshot_final.png "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
+        if [ -d TestResults.xcresult ]; then
+          ditto -c -k --sequesterRsrc --keepParent TestResults.xcresult TestResults.xcresult.zip || true
+          aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
+        fi
 
         # --- parse results: summary.json (authoritative, read by the Lambda) + JUnit (console) ---
-        aws s3 cp "s3://$ARTIFACTS_BUCKET/tooling/xcresult_to_junit.py" /tmp/conv.py
-        python3 /tmp/conv.py TestResults.xcresult "$CODEBUILD_SRC_DIR/test_results.xml" "$CODEBUILD_SRC_DIR/summary.json" || true
+        if [ -d TestResults.xcresult ]; then
+          aws s3 cp "s3://$ARTIFACTS_BUCKET/tooling/xcresult_to_junit.py" /tmp/conv.py
+          python3 /tmp/conv.py TestResults.xcresult "$CODEBUILD_SRC_DIR/test_results.xml" "$CODEBUILD_SRC_DIR/summary.json" || true
+        fi
         # summary.json is the contract with ios_build_status — upload even on failure.
+        if [ ! -f "$CODEBUILD_SRC_DIR/summary.json" ]; then
+          # No xcresult (failed before tests). Write a summary that points the
+          # agent at the build log so the failure is never opaque.
+          python3 -c "import json;json.dump({'total':0,'passed':0,'failed':0,'skipped':0,'error':'build failed before tests ran; see build_errors / get_build_log'}, open('$CODEBUILD_SRC_DIR/summary.json','w'))" || echo '{"total":0,"passed":0,"failed":0,"skipped":0}' > "$CODEBUILD_SRC_DIR/summary.json"
+        fi
         aws s3 cp "$CODEBUILD_SRC_DIR/summary.json" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/summary.json" || true
         echo "=== summary.json ==="; cat "$CODEBUILD_SRC_DIR/summary.json" || true
         exit $TEST_RC
