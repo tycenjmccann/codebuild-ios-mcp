@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>codebuild-ios-mcp — Architecture</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --ink:#e6edf3; --muted:#9198a1; --line:#30363d;
+    --agent:#a371f7;   /* AgentCore / MCP   */
+    --compute:#f0883e; /* Lambda / CodeBuild */
+    --storage:#3fb950; /* S3               */
+    --net:#58a6ff;     /* VPC / networking  */
+    --warn:#e3b341;
+    --card:#1c2128; --card2:#22272e;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 32px 56px}
+
+  header{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;
+    border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:8px}
+  h1{font-size:25px;margin:0;letter-spacing:-.4px}
+  h1 .mono{font-family:var(--mono);color:var(--agent);font-weight:600}
+  .sub{color:var(--muted);font-size:14px;margin-top:6px;max-width:640px;line-height:1.5}
+  .badge-iam{font-family:var(--mono);font-size:11px;color:var(--agent);
+    border:1px solid var(--agent);border-radius:999px;padding:5px 11px;white-space:nowrap;
+    background:rgba(163,113,247,.08)}
+
+  /* flow spine */
+  .spine{display:flex;flex-direction:column;align-items:center;margin-top:26px}
+  .node{width:100%;max-width:720px;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:16px 18px;position:relative;overflow:hidden}
+  .node::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,#888)}
+  .node.agent{--accent:var(--agent)} .node.gw{--accent:var(--agent)}
+  .node.lambda{--accent:var(--compute)}
+  .row-title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .chip{font-family:var(--mono);font-size:10.5px;letter-spacing:.3px;text-transform:uppercase;
+    color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:2px 7px}
+  .node h3{margin:0;font-size:16px}
+  .node .meta{color:var(--muted);font-size:13px;margin-top:6px;line-height:1.5}
+  .mono{font-family:var(--mono)}
+  .pill-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .pill{font-family:var(--mono);font-size:12px;background:var(--card2);border:1px solid var(--line);
+    border-radius:7px;padding:6px 10px;color:var(--ink)}
+  .pill b{color:var(--compute);font-weight:600}
+
+  /* connectors */
+  .conn{display:flex;flex-direction:column;align-items:center;color:var(--muted);
+    font-family:var(--mono);font-size:11.5px;padding:3px 0}
+  .conn .lbl{background:var(--bg);padding:2px 8px}
+  .arrow{width:2px;height:16px;background:linear-gradient(var(--line),var(--accent,#666));position:relative}
+  .arrow::after{content:"";position:absolute;left:50%;bottom:-1px;transform:translateX(-50%);
+    border:5px solid transparent;border-top-color:var(--accent,#666)}
+  .conn.agent{--accent:var(--agent)} .conn.compute{--accent:var(--compute)}
+
+  /* async loop badge */
+  .loop{align-self:flex-end;max-width:720px;width:100%;display:flex;justify-content:flex-end;margin:-6px 0 2px}
+  .loop .box{border:1px dashed var(--agent);border-radius:10px;padding:10px 13px;background:rgba(163,113,247,.06);
+    font-family:var(--mono);font-size:11.5px;color:var(--muted);line-height:1.7}
+  .loop .box b{color:var(--agent)} .loop .box .k{color:var(--ink)}
+
+  /* build plane: two columns */
+  .plane{width:100%;max-width:860px;margin-top:2px;position:relative}
+  .vpc{border:1.5px dashed var(--net);border-radius:14px;padding:30px 18px 18px;position:relative;
+    background:rgba(88,166,255,.045)}
+  .vpc-tag{position:absolute;top:-11px;left:18px;background:var(--bg);color:var(--net);
+    font-family:var(--mono);font-size:11px;padding:1px 9px;border:1px solid var(--net);border-radius:6px}
+  .vpc-tag b{color:var(--ink);font-weight:600}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:15px 16px;
+    position:relative;overflow:hidden}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,#888)}
+  .card.build{--accent:var(--compute)} .card.store{--accent:var(--storage)} .card.fleet{--accent:var(--compute)}
+  .card h3{margin:0 0 4px;font-size:15px} .card .meta{color:var(--muted);font-size:12.5px;line-height:1.5}
+  .filelist{margin-top:10px;display:flex;flex-direction:column;gap:5px}
+  .filelist div{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .filelist b{color:var(--storage);font-weight:600}
+  .between{display:flex;align-items:center;justify-content:center;color:var(--muted);
+    font-family:var(--mono);font-size:11px;gap:6px;margin:9px 0 4px}
+  .between .ar{color:var(--storage)}
+  .fleet-wrap{margin-top:13px}
+  .external{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+  .ext{background:var(--card2);border:1px solid var(--net);border-radius:10px;padding:12px 14px}
+  .ext h4{margin:0 0 3px;font-size:13.5px;color:var(--net)} .ext .meta{color:var(--muted);font-size:12px;line-height:1.45}
+  .ext-arrow{text-align:center;color:var(--net);font-family:var(--mono);font-size:11px;margin:10px 0 2px}
+  .endpoints{margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:var(--card)}
+  .endpoints .h{font-family:var(--mono);font-size:11px;color:var(--net);text-transform:uppercase;letter-spacing:.4px}
+  .endpoints .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .ep{font-family:var(--mono);font-size:11.5px;border:1px solid var(--net);border-radius:7px;padding:5px 9px;
+    color:var(--ink);background:rgba(88,166,255,.07)}
+
+  /* legend + footer */
+  .legend{display:grid;grid-template-columns:repeat(2,1fr);gap:10px 30px;max-width:860px;margin:30px auto 0;
+    border-top:1px solid var(--line);padding-top:20px}
+  .legend h4{grid-column:1/-1;margin:0 0 2px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .leg{display:flex;gap:10px;font-size:13px;color:var(--muted);align-items:baseline}
+  .leg .n{font-family:var(--mono);color:var(--ink);background:var(--card2);border:1px solid var(--line);
+    border-radius:5px;min-width:20px;text-align:center;padding:1px 0;font-size:11px}
+  .leg b{color:var(--ink);font-weight:600}
+  footer{max-width:860px;margin:22px auto 0;color:var(--muted);font-size:12px;line-height:1.6;
+    display:flex;gap:18px;flex-wrap:wrap;align-items:center}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
+  .keywrap{display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--muted)}
+  .warn{color:var(--warn)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1><span class="mono">codebuild-ios-mcp</span> — Architecture</h1>
+      <div class="sub">Agent-driven iOS build &amp; test on AWS CodeBuild macOS, exposed as four MCP tools
+        through a Bedrock AgentCore Gateway. Async by design: start a build, poll for the structured result.</div>
+    </div>
+    <div class="keywrap">
+      <span><span class="dot" style="background:var(--agent)"></span>AgentCore / MCP</span>
+      <span><span class="dot" style="background:var(--compute)"></span>Compute</span>
+      <span><span class="dot" style="background:var(--storage)"></span>Storage</span>
+      <span><span class="dot" style="background:var(--net)"></span>VPC / network</span>
+    </div>
+  </header>
+
+  <div class="spine">
+
+    <!-- async loop badge -->
+    <div class="loop"><div class="box">
+      <b>async loop</b><br>
+      <span class="k">①</span> id = <b>ios_test</b>(branch, scheme) &rarr; build_id<br>
+      <span class="k">②</span> poll <b>ios_build_status</b>(id) until status &ne; IN_PROGRESS<br>
+      <span class="k">③</span> on FAILED &rarr; <b>get_test_logs</b>(id, test)
+    </div></div>
+
+    <div class="node agent">
+      <div class="row-title"><span class="chip">caller</span><h3>AgentCore Runtime agent</h3></div>
+      <div class="meta">Signs requests with its <b>execution role</b> (ambient creds — no Cognito, no secret).
+        Needs only <span class="mono">bedrock-agentcore:InvokeGateway</span>.</div>
+    </div>
+
+    <div class="conn agent"><span class="lbl">① &nbsp;SigV4-signed MCP over HTTPS</span><div class="arrow"></div></div>
+
+    <div class="node gw">
+      <div class="row-title"><span class="chip">managed MCP</span><h3>Amazon Bedrock AgentCore Gateway</h3>
+        <span class="badge-iam">authorizer: AWS_IAM</span></div>
+      <div class="meta">Discovers &amp; routes the four tools via inline schema (<span class="mono">gateway-tools.json</span>).
+        No IaC resource yet &rarr; created by <span class="mono">scripts/register-gateway.sh</span>.</div>
+    </div>
+
+    <div class="conn agent"><span class="lbl">assumes GatewayInvokeRole</span><div class="arrow"></div></div>
+
+    <div class="node lambda">
+      <div class="row-title"><span class="chip">tool dispatcher</span><h3>Lambda <span class="mono">codebuild-ios-mcp</span></h3>
+        <span class="chip">python 3.12 · 256 MB · 30 s</span></div>
+      <div class="meta">One handler, four tools. Least-privilege role: StartBuild/BatchGetBuilds on the project, read-only S3.</div>
+      <div class="pill-row">
+        <span class="pill"><b>ios_test</b></span>
+        <span class="pill"><b>ios_build_status</b></span>
+        <span class="pill"><b>list_schemes</b></span>
+        <span class="pill"><b>get_test_logs</b></span>
+      </div>
+    </div>
+
+    <div class="conn compute"><span class="lbl">② StartBuild / BatchGetBuilds &nbsp;·&nbsp; reads summary.json + presigns URLs</span><div class="arrow"></div></div>
+
+    <!-- build plane wrapped by optional VPC -->
+    <div class="plane">
+      <div class="vpc">
+        <span class="vpc-tag">optional &nbsp;<b>Customer VPC</b>&nbsp; (vpcId / subnetIds / securityGroupIds)</span>
+
+        <div class="cols">
+          <div class="card build">
+            <h3>CodeBuild project <span class="mono">ios-agent-tests</span></h3>
+            <div class="meta">GITHUB source = your iOS repo. <span class="mono">buildspec.yaml</span> embedded inline
+              (repo needs none). 40-min timeout. Runs <span class="mono">xcodebuild test</span>.</div>
+          </div>
+          <div class="card store">
+            <h3>S3 artifacts bucket</h3>
+            <div class="meta">Private · SSE · <span class="mono">builds/&lt;id&gt;/</span> expires in 14 days.</div>
+            <div class="filelist">
+              <div><b>summary.json</b> &larr; authoritative pass/fail</div>
+              <div><b>TestResults.xcresult.zip</b> · <b>screenshots/</b></div>
+              <div><b>tooling/</b>xcresult_to_junit.py · <b>schemes/</b></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="between"><span>CodeBuild</span><span class="ar">&mdash; writes artifacts &rarr;</span><span>S3</span></div>
+
+        <div class="fleet-wrap">
+          <div class="card fleet">
+            <div class="row-title"><h3>MAC_ARM reserved fleet <span class="mono">ios-agent-tests-mac</span></h3>
+              <span class="chip warn">⚠ always-on billing</span></div>
+            <div class="meta"><span class="mono">BUILD_GENERAL1_MEDIUM</span> · Xcode + iOS simulator ·
+              baseCapacity 1 · overflow <span class="mono">QUEUE</span> (macOS has no on-demand).</div>
+          </div>
+        </div>
+
+        <div class="ext-arrow">▲ &nbsp; builds reach private resources over the VPC &nbsp; ▲</div>
+        <div class="external">
+          <div class="ext"><h4>Internal Nexus / artifact repo</h4><div class="meta">SPM / CocoaPods / Gradle pull at build time.</div></div>
+          <div class="ext"><h4>Internal validation services</h4><div class="meta">Tests hit private APIs &amp; tools.</div></div>
+        </div>
+
+        <div class="endpoints">
+          <div class="h">auto-created for no-NAT subnets &nbsp;(createVpcEndpoints, default on)</div>
+          <div class="row">
+            <span class="ep">S3 · gateway endpoint</span>
+            <span class="ep">CloudWatch Logs · interface</span>
+            <span class="ep">CodeBuild · interface</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <h4>Data flow</h4>
+    <div class="leg"><span class="n">①</span><span>Agent &rarr; Gateway over <b>SigV4-signed MCP</b>; gateway assumes its role and invokes the Lambda.</span></div>
+    <div class="leg"><span class="n">②</span><span>Lambda <b>starts the build</b>, then reads <b>summary.json</b> + presigned artifact URLs back from S3.</span></div>
+    <div class="leg"><span class="n">③</span><span>Build runs on the <b>macOS fleet</b>, writes results to S3; agent polls until done, drills into failures.</span></div>
+    <div class="leg"><span class="n mono" style="color:var(--net)">VPC</span><span>Optional: fleet joins your VPC to reach <b>Nexus + internal services</b>; endpoints keep AWS reachable.</span></div>
+  </div>
+
+  <footer>
+    <span><span class="dot" style="background:var(--warn)"></span><b style="color:var(--ink)">Cost:</b> reserved macOS fleet bills continuously (~$25–30/day/instance, ~24 h min lease). Tear down when idle.</span>
+    <span><b style="color:var(--ink)">Regions:</b> us-east-1/2, us-west-2, eu-central-1, ap-southeast-2.</span>
+    <span><b style="color:var(--ink)">Deploy:</b> <span class="mono">cdk deploy</span> &rarr; <span class="mono">register-gateway.sh</span>.</span>
+  </footer>
+
+</div>
+</body>
+</html>
