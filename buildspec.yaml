@@ -40,12 +40,14 @@ phases:
         # "permission denied" mid-run. Reclaim ownership + perms; if a dir is
         # still unwritable, reset it so the build proceeds cold and repopulates
         # the cache cleanly — never a hard failure on a poisoned cache.
+        # sudo -n: never block on a password prompt. CodeBuild has no tty, so a
+        # bare `sudo` could hang reading stdin; -n fails fast instead.
         ensure_writable() {
           local me; me="$(id -un)"
           for d in "$@"; do
-            mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d" 2>/dev/null || true
-            sudo chown -R "$me" "$d" 2>/dev/null || chown -R "$me" "$d" 2>/dev/null || true
-            chmod -R u+rwX "$d" 2>/dev/null || sudo chmod -R u+rwX "$d" 2>/dev/null || true
+            mkdir -p "$d" 2>/dev/null || sudo -n mkdir -p "$d" 2>/dev/null || true
+            sudo -n chown -R "$me" "$d" 2>/dev/null || chown -R "$me" "$d" 2>/dev/null || true
+            chmod -R u+rwX "$d" 2>/dev/null || sudo -n chmod -R u+rwX "$d" 2>/dev/null || true
             # A writable parent can still hide root-owned CHILDREN (e.g.
             # DerivedData/SourcePackages/repositories) that survive a failed
             # chown when sudo isn't honored on the cache mount. Probe the whole
@@ -54,7 +56,7 @@ phases:
             if find "$d" ! -user "$me" -print -quit 2>/dev/null | grep -q . \
                || ! ( mkdir -p "$d/.wtest" && : > "$d/.wtest/probe" ) 2>/dev/null; then
               echo "Cache dir poisoned/unwritable, resetting cold: $d"
-              sudo rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
+              sudo -n rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
               mkdir -p "$d"
             fi
             rm -rf "$d/.wtest" 2>/dev/null || true
@@ -101,20 +103,30 @@ phases:
           # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS run
           # without disturbing the cache: it points DerivedData at a fresh ephemeral
           # dir, so nothing cached is reused and the cache is left intact for next time.
-          # The SwiftPM home cache is restored on every cached build and is the
-          # usual POSIX-13 culprit; heal it whenever the cache is in play. Use
-          # the literal path the `cache:` block persists so the two can't drift.
-          SPM_HOME="/Users/cbuser/Library/Caches/org.swift.swiftpm"
+          # Global caches xcodebuild touches on EVERY build (clean or not),
+          # restored by the project cache with their prior owner. These are the
+          # literal paths the `cache:` block persists -- keep the two lists in
+          # sync. They must be healed even for a clean build, because clean_build
+          # only swaps DerivedData; SwiftPM/CocoaPods still read these and a
+          # root-owned restore here is what kills dep resolution with POSIX 13.
+          GLOBAL_CACHES=(
+            "/Users/cbuser/Library/Caches/org.swift.swiftpm"
+            "/Users/cbuser/Library/Caches/CocoaPods"
+          )
           DERIVED_ARGS=()
+          # When the project cache is active (CACHE_MODE != none, set in lockstep
+          # with the project's cache config), the global caches were restored and
+          # may be poisoned -- heal them regardless of clean_build.
+          [ "$CACHE_MODE" != "none" ] && ensure_writable "${GLOBAL_CACHES[@]}"
           if [ "$CLEAN_BUILD" = "true" ]; then
             DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
             mkdir -p "$DERIVED"
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-            echo "Clean build requested -> fresh DerivedData at $DERIVED (cache untouched)"
+            echo "Clean build requested -> fresh DerivedData at $DERIVED (persisted DerivedData untouched)"
           elif [ "$CACHE_MODE" != "none" ]; then
             DERIVED="/tmp/ios-mcp-cache/DerivedData"
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-            ensure_writable "$DERIVED" "$SPM_HOME"
+            ensure_writable "$DERIVED"
             echo "Cache mode: $CACHE_MODE -> $DERIVED"
           fi
 
