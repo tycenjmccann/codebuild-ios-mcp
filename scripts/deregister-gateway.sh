@@ -9,6 +9,11 @@
 #   GATEWAY_ID=codebuild-ios-mcp-gw-abc1234567 scripts/deregister-gateway.sh
 #   GATEWAY_NAME=codebuild-ios-mcp-gw          scripts/deregister-gateway.sh
 #
+# Shared gateway (registered with EXISTING_GATEWAY_ID): delete ONLY this stack's
+# target and leave the gateway in place by setting KEEP_GATEWAY=1 (and ideally
+# TARGET_ID so siblings on the same gateway are untouched):
+#   KEEP_GATEWAY=1 TARGET_ID=ABC123 GATEWAY_ID=my-shared-gw scripts/deregister-gateway.sh
+#
 # Requirements: aws cli v2, jq.
 #
 set -euo pipefail
@@ -17,6 +22,8 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 
 GATEWAY_ID="${GATEWAY_ID:-}"
 GATEWAY_NAME="${GATEWAY_NAME:-codebuild-ios-mcp-gw}"
+TARGET_ID="${TARGET_ID:-}"
+KEEP_GATEWAY="${KEEP_GATEWAY:-}"
 
 # Resolve id from name if only the name was given.
 if [ -z "$GATEWAY_ID" ]; then
@@ -31,16 +38,29 @@ fi
 }
 echo "GatewayId=$GATEWAY_ID"
 
-echo "Deleting targets..."
-TARGET_IDS="$(aws bedrock-agentcore-control list-gateway-targets \
-  --gateway-identifier "$GATEWAY_ID" \
-  --query 'items[].targetId' --output text 2>/dev/null || echo "")"
-
-for tid in $TARGET_IDS; do
-  echo "  deleting target $tid"
+if [ -n "$TARGET_ID" ]; then
+  # Targeted delete — only this one target. Used for shared gateways.
+  echo "Deleting target $TARGET_ID..."
   aws bedrock-agentcore-control delete-gateway-target \
-    --gateway-identifier "$GATEWAY_ID" --target-id "$tid" >/dev/null
-done
+    --gateway-identifier "$GATEWAY_ID" --target-id "$TARGET_ID" >/dev/null
+else
+  echo "Deleting targets..."
+  TARGET_IDS="$(aws bedrock-agentcore-control list-gateway-targets \
+    --gateway-identifier "$GATEWAY_ID" \
+    --query 'items[].targetId' --output text 2>/dev/null || echo "")"
+
+  for tid in $TARGET_IDS; do
+    echo "  deleting target $tid"
+    aws bedrock-agentcore-control delete-gateway-target \
+      --gateway-identifier "$GATEWAY_ID" --target-id "$tid" >/dev/null
+  done
+fi
+
+if [ -n "$KEEP_GATEWAY" ]; then
+  echo "KEEP_GATEWAY set — leaving gateway $GATEWAY_ID in place."
+  echo "Done."
+  exit 0
+fi
 
 echo "Deleting gateway $GATEWAY_ID..."
 aws bedrock-agentcore-control delete-gateway --gateway-identifier "$GATEWAY_ID" >/dev/null
