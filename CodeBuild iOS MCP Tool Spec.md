@@ -537,7 +537,7 @@ Agent receives structured result:
 - **Parallel test sharding:** Split test plan across multiple CodeBuild instances
 - **Screenshot diff:** Compare screenshots against baseline images, return visual diff
 - **Code coverage delta:** Return coverage % change vs main branch
-- **Caching:** Persist DerivedData in S3 between builds for faster subsequent runs
+- ~~**Caching:** Persist DerivedData between builds for faster subsequent runs~~ — DONE: warm DerivedData + resolved SPM persist in `$HOME/ios-mcp-state` on the always-on reserved Mac (no CodeBuild cache feature; see buildspec)
 - **XCUITest video recording:** `xcrun simctl io booted recordVideo` for full test session recording
 - **AgentCore Gateway registration:** Register this MCP server as an AgentCore Gateway tool for multi-agent access
 

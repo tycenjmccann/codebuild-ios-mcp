@@ -40,9 +40,9 @@ def ios_test(args: dict) -> dict:
     ]
     if args.get("test_plan"):
         env.append({"name": "TEST_PLAN", "value": args["test_plan"], "type": "PLAINTEXT"})
-    # Per-call clean build: force a cold compile for this run (skip cached
-    # DerivedData) without disturbing the cache. Use when a cached incremental
-    # build is suspect or for a guaranteed-clean validation run.
+    # Per-call clean build: force a cold compile for this run (throwaway
+    # DerivedData) without disturbing the warm build state on the reserved Mac.
+    # Use when an incremental build is suspect or for a guaranteed-clean run.
     if args.get("clean_build"):
         env.append({"name": "CLEAN_BUILD", "value": "true", "type": "PLAINTEXT"})
     # Per-call subdir override (multi-app on one shared project: each repo's
