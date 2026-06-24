@@ -42,25 +42,52 @@ phases:
         # the cache cleanly — never a hard failure on a poisoned cache.
         # sudo -n: never block on a password prompt. CodeBuild has no tty, so a
         # bare `sudo` could hang reading stdin; -n fails fast instead.
+        #
+        # Is the whole tree owned by us AND writable to a nested depth? A
+        # writable parent can still hide root-owned CHILDREN (e.g.
+        # DerivedData/SourcePackages/repositories) that kill dep resolution
+        # with POSIX 13.
+        tree_writable() {
+          local d="$1" me; me="$(id -un)"
+          [ -d "$d" ] || return 1
+          find "$d" ! -user "$me" -print -quit 2>/dev/null | grep -q . && return 1
+          ( mkdir -p "$d/.wtest" && : > "$d/.wtest/probe" ) 2>/dev/null || return 1
+          rm -rf "$d/.wtest" 2>/dev/null || true
+          return 0
+        }
+
+        # Best-effort heal of a restored cache dir in place (chown/chmod back to
+        # the build user). Used for global caches that live at fixed paths and
+        # can't be relocated.
         ensure_writable() {
           local me; me="$(id -un)"
           for d in "$@"; do
             mkdir -p "$d" 2>/dev/null || sudo -n mkdir -p "$d" 2>/dev/null || true
             sudo -n chown -R "$me" "$d" 2>/dev/null || chown -R "$me" "$d" 2>/dev/null || true
             chmod -R u+rwX "$d" 2>/dev/null || sudo -n chmod -R u+rwX "$d" 2>/dev/null || true
-            # A writable parent can still hide root-owned CHILDREN (e.g.
-            # DerivedData/SourcePackages/repositories) that survive a failed
-            # chown when sudo isn't honored on the cache mount. Probe the whole
-            # tree: any path not owned by us, or a failed NESTED write, means
-            # repair didn't take -> reset that dir cold so the run proceeds.
-            if find "$d" ! -user "$me" -print -quit 2>/dev/null | grep -q . \
-               || ! ( mkdir -p "$d/.wtest" && : > "$d/.wtest/probe" ) 2>/dev/null; then
-              echo "Cache dir poisoned/unwritable, resetting cold: $d"
+            if ! tree_writable "$d"; then
+              echo "Cache dir poisoned, resetting cold: $d"
               sudo -n rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
-              mkdir -p "$d"
+              mkdir -p "$d" 2>/dev/null || true
             fi
-            rm -rf "$d/.wtest" 2>/dev/null || true
           done
+        }
+
+        # Resolve a usable DerivedData dir. Prefer the warm stable cache; heal it
+        # if poisoned. If it STILL isn't writable (root-owned tree on a mount
+        # where sudo isn't honored, so we can neither chown nor rm it), fall back
+        # to a fresh per-build path the build user owns by construction -- the
+        # build stays green (cold this run) instead of dying POSIX 13. Echoes the
+        # chosen path. Warmth resumes automatically once the stable path is
+        # writable again (instance recycle / a successful reset).
+        writable_derived() {
+          local stable="$1" me; me="$(id -un)"
+          ensure_writable "$stable" >&2
+          if tree_writable "$stable"; then echo "$stable"; return; fi
+          local fresh="/tmp/ios-mcp-run-$CODEBUILD_BUILD_ID/DerivedData"
+          mkdir -p "$fresh"
+          echo "WARN: stable DerivedData cache unusable; using fresh $fresh (cold build)" >&2
+          echo "$fresh"
         }
 
         # Everything below runs inside run() so we can pipe the whole thing to
@@ -124,9 +151,8 @@ phases:
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
             echo "Clean build requested -> fresh DerivedData at $DERIVED (persisted DerivedData untouched)"
           elif [ "$CACHE_MODE" != "none" ]; then
-            DERIVED="/tmp/ios-mcp-cache/DerivedData"
+            DERIVED="$(writable_derived /tmp/ios-mcp-cache/DerivedData)"
             DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-            ensure_writable "$DERIVED"
             echo "Cache mode: $CACHE_MODE -> $DERIVED"
           fi
 
