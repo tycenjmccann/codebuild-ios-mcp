@@ -22,13 +22,25 @@
   },
   {
     "name": "ios_build_status",
-    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with a test summary, per-test failures, and presigned artifact URLs: xcresult_url (full bundle zip), screenshots[] (every image captured by the test plus the final frame), assets_url (one zip of all visual evidence — images + session video — to download and unzip), session_video_url (whole-session mp4, present only if ios_test set record_session), and a CloudWatch logs link.",
+    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS with compute_size and the phase timeline. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with: compute_size (medium|large, where it ran), test_summary, per-test failures, a metrics object (compile count, cache_state cold/partial/warm, cache restore + save seconds, per-phase seconds, test timing) for warm/cold and cache diagnosis, and presigned artifact URLs: xcresult_url (full bundle zip), screenshots[] (every image captured by the test plus the final frame), assets_url (one zip of all visual evidence — images + session video — to download and unzip), session_video_url (whole-session mp4, present only if ios_test set record_session), and a CloudWatch logs link.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "build_id": { "type": "string", "description": "CodeBuild build id returned by ios_test" }
       },
       "required": ["build_id"]
+    }
+  },
+  {
+    "name": "ios_list_builds",
+    "description": "List recent builds for the project with status, current_phase, compute_size, and duration, plus running/queued counts. Use this to see pool/queue state across the medium and large fleets (which builds are RUNNING vs QUEUED) when driving several builds at once — CodeBuild has no per-instance view, so this is how to tell what is actually executing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": { "type": "integer", "description": "Max builds to return, newest first (default 20, max 50)" },
+        "compute_size": { "type": "string", "enum": ["medium", "large"], "description": "Optional filter to one fleet size." }
+      },
+      "required": []
     }
   },
   {

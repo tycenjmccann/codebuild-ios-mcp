@@ -1,9 +1,9 @@
 """codebuild-ios-mcp — AgentCore Gateway Lambda target.
 
-Hosts six MCP tools (ios_test, ios_build_status, list_schemes, get_test_logs,
-get_build_log, ios_cancel) behind a single Lambda. Gateway invokes it per tool
-call, passing the tool name in the client context and the tool arguments as the
-event payload.
+Hosts seven MCP tools (ios_test, ios_build_status, ios_list_builds, list_schemes,
+get_test_logs, get_build_log, ios_cancel) behind a single Lambda. Gateway invokes
+it per tool call, passing the tool name in the client context and the tool
+arguments as the event payload.
 
 Async by design: ios_test starts a CodeBuild run and returns the build_id
 immediately. Agents poll ios_build_status until status != IN_PROGRESS. This
@@ -124,6 +124,7 @@ def ios_build_status(args: dict) -> dict:
 
     if cb_status == "IN_PROGRESS":
         return {"status": "IN_PROGRESS", "build_id": build_id,
+                "compute_size": _compute_size(build),
                 "current_phase": build.get("currentPhase", ""),
                 "phases": phases}
 
@@ -149,12 +150,18 @@ def ios_build_status(args: dict) -> dict:
     return {
         "status": status,
         "build_id": build_id,
+        "compute_size": _compute_size(build),
         "duration_seconds": duration,
         "test_summary": summary,
         "failures": failures,
         "artifacts": artifacts,
         "build_errors": build_errors,
         "phases": phases,
+        # Self-reported build performance (compile count, cache hit/miss, restore
+        # + save seconds, per-phase secs) from the buildspec's metrics.json. Lets
+        # a consumer read warm/cold + cache outcome as structured fields instead
+        # of grepping the raw log. Empty {} when the build predates metrics.json.
+        "metrics": _get_metrics(build_id),
     }
 
 
@@ -271,6 +278,42 @@ def ios_cancel(args: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Tool: ios_list_builds — pool/queue visibility. CodeBuild has no per-build
+# "which instance" view, so an agent driving several builds is otherwise blind
+# to what's RUNNING vs QUEUED on each size's fleet. Returns the most recent
+# builds with status/phase/size/timing so the caller can see queue depth.
+# --------------------------------------------------------------------------- #
+def ios_list_builds(args: dict) -> dict:
+    limit = min(int(args.get("limit", 20)), 50)
+    ids = codebuild.list_builds_for_project(
+        projectName=PROJECT, sortOrder="DESCENDING").get("ids", [])[:limit]
+    if not ids:
+        return {"builds": [], "running": 0, "queued": 0}
+    builds = codebuild.batch_get_builds(ids=ids).get("builds", [])
+    want = args.get("compute_size")  # optional filter: "medium" | "large"
+    out, running, queued = [], 0, 0
+    for b in builds:
+        size = _compute_size(b)
+        if want and size != want:
+            continue
+        st = b.get("buildStatus")
+        phase = b.get("currentPhase", "")
+        if st == "IN_PROGRESS":
+            if phase == "QUEUED":
+                queued += 1
+            else:
+                running += 1
+        out.append({
+            "build_id": b.get("id", ""),
+            "status": st,
+            "current_phase": phase,
+            "compute_size": size,
+            "duration_seconds": _duration(b),
+        })
+    return {"builds": out, "running": running, "queued": queued}
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _duration(build: dict) -> int:
@@ -351,6 +394,27 @@ def _get_test_results(build_id: str):
     return summary, failures
 
 
+def _compute_size(build: dict) -> str:
+    """Map the build's resolved compute type to the friendly size the caller
+    passed to ios_test, so status echoes WHERE it ran (medium vs large)."""
+    ct = (build.get("environment", {}) or {}).get("computeType", "")
+    return {"BUILD_GENERAL1_LARGE": "large",
+            "BUILD_GENERAL1_MEDIUM": "medium"}.get(ct, ct or "unknown")
+
+
+def _get_metrics(build_id: str) -> dict:
+    """Read the buildspec's self-reported metrics.json (compile count, cache
+    state, restore/save secs, per-phase secs, test timing). Empty when absent
+    (build predates metrics, or failed before writing it)."""
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=f"builds/{build_id}/metrics.json")
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return {}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _list_presigned(prefix: str):
     urls = []
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
@@ -422,6 +486,7 @@ def _extract_build_errors(build: dict):
 TOOLS = {
     "ios_test": ios_test,
     "ios_build_status": ios_build_status,
+    "ios_list_builds": ios_list_builds,
     "list_schemes": list_schemes,
     "get_test_logs": get_test_logs,
     "get_build_log": get_build_log,

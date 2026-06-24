@@ -400,8 +400,14 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'CodeBuildRunAndRead',
-        // StopBuild powers ios_cancel; BatchGetBuilds powers status + phase timeline.
-        actions: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds', 'codebuild:StopBuild'],
+        // StopBuild powers ios_cancel; BatchGetBuilds powers status + phase
+        // timeline; ListBuildsForProject powers ios_list_builds (pool/queue view).
+        actions: [
+          'codebuild:StartBuild',
+          'codebuild:BatchGetBuilds',
+          'codebuild:StopBuild',
+          'codebuild:ListBuildsForProject',
+        ],
         resources: [project.projectArn],
       }),
     );
