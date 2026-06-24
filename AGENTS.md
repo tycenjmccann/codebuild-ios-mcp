@@ -64,15 +64,19 @@ else tool calls AccessDenied. Tear down just the target with
 Private repo: `aws codebuild import-source-credentials --server-type GITHUB
 --auth-type PERSONAL_ACCESS_TOKEN --token <pat>` once per account/region first.
 
-Cache (fix→retest loop): default `cacheMode=local` (warm DerivedData on the
-reserved Mac — builds are incremental out of the box). `=s3` for durable per-app
-cache (best one-project-per-app); `=none` for always-clean validation. Per-call
-`clean_build: true` on `ios_test` forces a cold run without touching the cache.
+Cache (fix→retest loop): builds are incremental out of the box, no flag. The
+reserved Mac stays alive between builds, so the buildspec points Xcode at a
+stable build-user-owned `$HOME/ios-mcp-state` (DerivedData + resolved SPM); the
+next build on the warm instance recompiles only what changed. Do NOT reintroduce
+CodeBuild's `cache:` feature — `LOCAL_CUSTOM_CACHE` symlinks through a root-owned
+store the build user can't write (POSIX 13), and S3 cache is needless zip/
+download while the instance persists. Per-call `clean_build: true` on `ios_test`
+forces a cold run (throwaway DerivedData) without touching the warm state.
 
 Many apps: ALWAYS one shared fleet (only cost) — never one fleet per app. Either
 one shared project (agent passes `repo` + `project_dir` to `ios_test` per call)
-or one stack/project per app (isolated history + s3 cache). Gateway/Lambda/tools
-are unchanged either way.
+or one stack/project per app (isolated history). Gateway/Lambda/tools are
+unchanged either way.
 
 VPC (internal Nexus / validation services): add
 `-c codebuild-ios-mcp:vpcId=… -c codebuild-ios-mcp:subnetIds=a,b -c codebuild-ios-mcp:securityGroupIds=sg`.

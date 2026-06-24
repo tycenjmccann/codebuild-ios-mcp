@@ -51,19 +51,6 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
    * when VPC mode is off. Default true.
    */
   readonly createVpcEndpoints?: boolean;
-  /**
-   * Build cache to tighten the fix->retest loop by reusing DerivedData + SPM
-   * between builds:
-   *   'none'  — every build is cold (default; unchanged behavior).
-   *   'local' — cache persists on the warm reserved Mac (fastest; ideal when one
-   *             shared project builds many apps — the fleet keeps each app's
-   *             DerivedData warm between runs).
-   *   's3'    — durable cache in the artifacts bucket under cache/<app>/; survives
-   *             instance replacement. Best paired with one-project-per-app so each
-   *             app's cache is isolated. Slower than local (download/upload) but
-   *             portable.
-   */
-  readonly cacheMode?: 'none' | 'local' | 's3';
 }
 
 /**
@@ -298,18 +285,11 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       [key: string]: unknown;
     };
 
-    // Build cache: 'local' keeps DerivedData/SPM warm on the reserved Mac;
-    // 's3' stores it durably in the artifacts bucket; 'none' is cold every time.
-    const cacheMode = props.cacheMode ?? 'none';
-    let cache: codebuild.Cache | undefined;
-    if (cacheMode === 's3') {
-      cache = codebuild.Cache.bucket(artifactsBucket, { prefix: 'cache' });
-    } else if (cacheMode === 'local') {
-      cache = codebuild.Cache.local(
-        codebuild.LocalCacheMode.CUSTOM,
-        codebuild.LocalCacheMode.SOURCE,
-      );
-    }
+    // No CodeBuild cache construct: warm DerivedData + resolved SPM persist in
+    // $HOME/ios-mcp-state on the reserved Mac (the instance stays alive between
+    // builds). LOCAL_CUSTOM_CACHE symlinks through a root-owned store the build
+    // user can't write (POSIX 13); S3 cache adds zip/download overhead unneeded
+    // while the instance persists. The buildspec owns warm-state handling.
 
     const project = new codebuild.Project(this, 'IosTestProject', {
       projectName,
@@ -321,7 +301,6 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       buildSpec: codebuild.BuildSpec.fromObjectToYaml(buildspecObject),
       role: codeBuildRole,
       timeout: cdk.Duration.minutes(40),
-      cache,
       environment: {
         // The L2 rejects a Mac image at construct time ("Mac images must be used
         // with a fleet") because it can't see the fleet we attach below via
@@ -334,7 +313,6 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       environmentVariables: {
         ARTIFACTS_BUCKET: { value: artifactsBucket.bucketName },
         PROJECT_DIR: { value: props.projectDir },
-        CACHE_MODE: { value: cacheMode },
       },
       logging: {
         cloudWatch: { logGroup: codeBuildLogGroup, enabled: true },

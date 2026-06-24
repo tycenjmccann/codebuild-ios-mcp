@@ -14,8 +14,7 @@ env:
     OS_VERSION: "latest"
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
-    CACHE_MODE: "none"  # none | local | s3 — set by the CDK stack's cacheMode
-    CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build, cache untouched
+    CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build; warm state untouched
 
 phases:
   build:
@@ -31,64 +30,6 @@ phases:
         # PROJECT_DIR, scheme not found, compile/dep error). That is the contract
         # the get_build_log tool reads, so the agent always sees the raw error.
         LOG="$CODEBUILD_SRC_DIR/build_output.log"
-
-        # Repair cache writability before xcodebuild touches it. CodeBuild macOS
-        # restores cached dirs (DerivedData, the SwiftPM home cache) from a prior
-        # build's tarball, which preserves ownership. If any earlier run wrote
-        # there as root, the restored files come back root-owned and the build
-        # user can't write them, so package resolution dies with POSIX 13
-        # "permission denied" mid-run. Reclaim ownership + perms; if a dir is
-        # still unwritable, reset it so the build proceeds cold and repopulates
-        # the cache cleanly — never a hard failure on a poisoned cache.
-        # sudo -n: never block on a password prompt. CodeBuild has no tty, so a
-        # bare `sudo` could hang reading stdin; -n fails fast instead.
-        #
-        # Is the whole tree owned by us AND writable to a nested depth? A
-        # writable parent can still hide root-owned CHILDREN (e.g.
-        # DerivedData/SourcePackages/repositories) that kill dep resolution
-        # with POSIX 13.
-        tree_writable() {
-          local d="$1" me; me="$(id -un)"
-          [ -d "$d" ] || return 1
-          find "$d" ! -user "$me" -print -quit 2>/dev/null | grep -q . && return 1
-          ( mkdir -p "$d/.wtest" && : > "$d/.wtest/probe" ) 2>/dev/null || return 1
-          rm -rf "$d/.wtest" 2>/dev/null || true
-          return 0
-        }
-
-        # Best-effort heal of a restored cache dir in place (chown/chmod back to
-        # the build user). Used for global caches that live at fixed paths and
-        # can't be relocated.
-        ensure_writable() {
-          local me; me="$(id -un)"
-          for d in "$@"; do
-            mkdir -p "$d" 2>/dev/null || sudo -n mkdir -p "$d" 2>/dev/null || true
-            sudo -n chown -R "$me" "$d" 2>/dev/null || chown -R "$me" "$d" 2>/dev/null || true
-            chmod -R u+rwX "$d" 2>/dev/null || sudo -n chmod -R u+rwX "$d" 2>/dev/null || true
-            if ! tree_writable "$d"; then
-              echo "Cache dir poisoned, resetting cold: $d"
-              sudo -n rm -rf "$d" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
-              mkdir -p "$d" 2>/dev/null || true
-            fi
-          done
-        }
-
-        # Resolve a usable DerivedData dir. Prefer the warm stable cache; heal it
-        # if poisoned. If it STILL isn't writable (root-owned tree on a mount
-        # where sudo isn't honored, so we can neither chown nor rm it), fall back
-        # to a fresh per-build path the build user owns by construction -- the
-        # build stays green (cold this run) instead of dying POSIX 13. Echoes the
-        # chosen path. Warmth resumes automatically once the stable path is
-        # writable again (instance recycle / a successful reset).
-        writable_derived() {
-          local stable="$1" me; me="$(id -un)"
-          ensure_writable "$stable" >&2
-          if tree_writable "$stable"; then echo "$stable"; return; fi
-          local fresh="/tmp/ios-mcp-run-$CODEBUILD_BUILD_ID/DerivedData"
-          mkdir -p "$fresh"
-          echo "WARN: stable DerivedData cache unusable; using fresh $fresh (cold build)" >&2
-          echo "$fresh"
-        }
 
         # Everything below runs inside run() so we can pipe the whole thing to
         # tee and still recover the real exit code via PIPESTATUS. Use `return`
@@ -123,38 +64,33 @@ phases:
           [ -z "$DEST_ID" ] && { echo "ERROR: no iPhone simulator available"; return 1; }
           xcrun simctl boot "$DEST_ID" || true
 
-          # --- build cache: reuse DerivedData across builds when enabled ---
-          # CACHE_MODE local/s3 -> point DerivedData at a cached dir so only changed
-          # files recompile on the next run (the tight fix->retest loop). The paths
-          # in this file's `cache:` block are what CodeBuild persists.
-          # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS run
-          # without disturbing the cache: it points DerivedData at a fresh ephemeral
-          # dir, so nothing cached is reused and the cache is left intact for next time.
-          # Global caches xcodebuild touches on EVERY build (clean or not),
-          # restored by the project cache with their prior owner. These are the
-          # literal paths the `cache:` block persists -- keep the two lists in
-          # sync. They must be healed even for a clean build, because clean_build
-          # only swaps DerivedData; SwiftPM/CocoaPods still read these and a
-          # root-owned restore here is what kills dep resolution with POSIX 13.
-          GLOBAL_CACHES=(
-            "/Users/cbuser/Library/Caches/org.swift.swiftpm"
-            "/Users/cbuser/Library/Caches/CocoaPods"
-          )
-          DERIVED_ARGS=()
-          # When the project cache is active (CACHE_MODE != none, set in lockstep
-          # with the project's cache config), the global caches were restored and
-          # may be poisoned -- heal them regardless of clean_build.
-          [ "$CACHE_MODE" != "none" ] && ensure_writable "${GLOBAL_CACHES[@]}"
+          # --- warm build state: persist DerivedData + resolved SPM on the
+          #     reserved Mac itself ---
+          # Reserved-capacity fleets keep the instance alive between builds (only
+          # the source dir is re-cloned each run), so the simplest, fastest cache
+          # is just a stable directory the build user owns. We do NOT use
+          # CodeBuild's `cache:` feature: LOCAL_CUSTOM_CACHE symlinks through a
+          # root-owned backing store the build user can't write (POSIX 13), and
+          # S3 cache adds zip/download overhead we don't need when the box stays
+          # up. xcodebuild reuses warm DerivedData -> only changed files
+          # recompile on the next build that lands on this instance (the tight
+          # fix->retest loop). With baseCapacity=1 every retest hits the warm box.
+          #
+          # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS
+          # run by using a fresh ephemeral DerivedData, leaving the warm state
+          # intact for the next normal build.
+          WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
           if [ "$CLEAN_BUILD" = "true" ]; then
             DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
-            mkdir -p "$DERIVED"
-            DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-            echo "Clean build requested -> fresh DerivedData at $DERIVED (persisted DerivedData untouched)"
-          elif [ "$CACHE_MODE" != "none" ]; then
-            DERIVED="$(writable_derived /tmp/ios-mcp-cache/DerivedData)"
-            DERIVED_ARGS=(-derivedDataPath "$DERIVED")
-            echo "Cache mode: $CACHE_MODE -> $DERIVED"
+            SPM_DIR="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/SourcePackages"
+            echo "Clean build requested -> fresh DerivedData at $DERIVED (warm state untouched)"
+          else
+            DERIVED="$WARM_ROOT/DerivedData"
+            SPM_DIR="$WARM_ROOT/SourcePackages"
+            echo "Warm build -> reusing $DERIVED (incremental when this instance is warm)"
           fi
+          mkdir -p "$DERIVED" "$SPM_DIR"
+          DERIVED_ARGS=(-derivedDataPath "$DERIVED" -clonedSourcePackagesDirPath "$SPM_DIR")
 
           # --- resolve deps (surface failures; do not swallow), then test ---
           echo "=== resolvePackageDependencies ==="
@@ -224,11 +160,8 @@ artifacts:
     - "screenshot_final.png"
   base-directory: "."
 
-# Paths CodeBuild persists between builds when cacheMode is 'local' or 's3'
-# (ignored when 'none'). DerivedData is the big win for the fix->retest loop;
-# SPM/CocoaPods caches avoid re-downloading dependencies.
-cache:
-  paths:
-    - "/tmp/ios-mcp-cache/DerivedData/**/*"
-    - "/Users/cbuser/Library/Caches/org.swift.swiftpm/**/*"
-    - "/Users/cbuser/Library/Caches/CocoaPods/**/*"
+# No `cache:` block on purpose. Warm DerivedData + resolved SPM live in
+# $HOME/ios-mcp-state on the reserved Mac, which stays alive between builds.
+# CodeBuild's LOCAL_CUSTOM_CACHE symlinks through a root-owned store the build
+# user can't write (POSIX 13); S3 cache adds zip/download overhead unneeded
+# while the instance persists. See the build phase for details.

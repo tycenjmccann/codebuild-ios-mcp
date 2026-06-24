@@ -108,7 +108,6 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:subnetIds`            | `""`                                                          | Comma-separated subnet ids for the fleet            |
 | `codebuild-ios-mcp:securityGroupIds`     | `""`                                                          | Comma-separated security group ids for the fleet    |
 | `codebuild-ios-mcp:createVpcEndpoints`   | `true`                                                        | When in a VPC, auto-create S3/Logs/CodeBuild endpoints (set `false` if you have a NAT) |
-| `codebuild-ios-mcp:cacheMode`            | `local`                                                       | Build cache: `local` / `none` / `s3` — `local` keeps the fix→retest loop fast (default) |
 
 See [Connect builds to your private network](#connect-builds-to-your-private-network-nexus-internal-services)
 for the VPC keys.
@@ -330,23 +329,31 @@ The subnets still must route to your internal resources (Nexus, validation
 services) via your own NAT/Transit Gateway/peering. Nothing else changes — the
 same six MCP tools work whether or not the fleet is in a VPC.
 
-### The fix → retest loop (build cache)
+### The fix → retest loop (warm builds)
 
-**Builds are incremental by default** (`cacheMode=local`): the first build of an
-app is cold, but every build after reuses warm DerivedData/SPM on the reserved
-Mac, so re-tests finish in a fraction of the time. That is the whole point of the
-agent loop, so it is on out of the box — no flag needed.
+**Builds are incremental by default — no flag, no cache config.** Reserved
+capacity fleets keep the Mac instance alive between builds (only the source dir
+is re-cloned each run), so the buildspec simply points Xcode at a stable
+`$HOME/ios-mcp-state` directory the build user owns. The first build of an app is
+cold; every build after that lands on the warm instance and reuses DerivedData +
+resolved SPM, so re-tests finish in a fraction of the time. That is the whole
+point of the agent loop, so it works out of the box.
 
-| `cacheMode` | What it does | Best for |
-| ----------- | ------------ | -------- |
-| `local` (default) | DerivedData + source stay warm on the reserved Mac (fastest; no upload/download) | the agent fix→retest loop; one shared project building many apps |
-| `none` | Every build clones + compiles from scratch | always-clean validation only |
-| `s3` | Cache stored durably in the artifacts bucket under `cache/`; survives instance replacement | one-project-per-app, or when you need the cache to outlive the fleet |
+This deliberately does **not** use CodeBuild's `cache:` feature:
 
-Need a guaranteed cold build for one run without changing the deploy? Pass
-**`clean_build: true`** to `ios_test` — it skips the cached DerivedData for that
-run and leaves the cache intact for the next. No redeploy. The cache paths live
-in `buildspec.yaml`'s `cache:` block.
+- `LOCAL_CUSTOM_CACHE` symlinks the cached dirs through a CodeBuild-managed,
+  root-owned backing store the macOS build user cannot write — package
+  resolution dies mid-build with `permission denied` (POSIX 13).
+- `S3` cache works, but adds zip + upload/download on every build — pure
+  overhead when the reserved instance already persists the data on local disk.
+
+With `baseCapacity=1` (one always-on Mac) every retest hits the warm box. With
+more instances a build can land on a cold one, recompile once, then stay warm.
+Warm state is lost only when AWS recycles the instance or you `cdk destroy`.
+
+Need a guaranteed cold build for one run? Pass **`clean_build: true`** to
+`ios_test` — it compiles into a fresh throwaway DerivedData for that run and
+leaves the warm state intact for the next. No redeploy.
 
 ### Many apps on one stack
 
@@ -355,12 +362,11 @@ per app. Two ways to serve multiple apps on it:
 
 - **One shared project (simplest).** Pass `repo` (and `project_dir`) to `ios_test`
   per call; the shared project points at that GitHub repo for the run. Zero
-  per-app setup — add an app by aiming the tool at its repo. Pair with
-  `cacheMode=local`.
+  per-app setup — add an app by aiming the tool at its repo. Warm state on the
+  instance is shared across apps (each app keeps its own DerivedData subtree).
 - **One project per app.** Deploy the stack once per app (distinct `githubRepo`)
-  for isolated build history, logs, metrics, and an isolated `s3` cache prefix.
-  The enterprise shape (e.g. a large app with strict separation). Pair with
-  `cacheMode=s3`.
+  for isolated build history, logs, and metrics. The enterprise shape (e.g. a
+  large app with strict separation).
 
 Either way the Gateway, Lambda, and tools are unchanged.
 
