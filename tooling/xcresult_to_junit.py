@@ -4,7 +4,12 @@
 Emits two files from one xcresulttool pass:
   1. summary.json  — the authoritative source the MCP Lambda reads. Shape:
        {"total","passed","failed","skipped",
-        "failures":[{"test_name","class_name","message","duration_ms"}]}
+        "failures":[{"test_name","class_name","message","duration_ms"}],
+        "timing":{                       # test-process performance metrics
+          "test_total_ms",               # sum of all case durations
+          "by_suite":[{"suite","total_ms","count"}],
+          "slowest":[{"test_name","class_name","duration_ms"}]   # top 10
+        }}
   2. JUnit XML     — for the CodeBuild Test Reports console view (secondary).
 
 We do NOT rely on CodeBuild's JUnit parser for correctness — it silently
@@ -99,6 +104,28 @@ def main():
     failed = sum(1 for c in uniq if c["failed"])
     skipped = sum(1 for c in uniq if c["skipped"] and not c["failed"])
     passed = len(uniq) - failed - skipped
+
+    # Test-process performance: roll per-case durations (already parsed) up into
+    # a total, per-suite breakdown, and the slowest tests. This is the "how long
+    # did testing take and where" view, distinct from the pass/fail results.
+    by_suite = {}
+    for c in uniq:
+        s = by_suite.setdefault(c["class_name"] or "(none)", {"total_ms": 0.0, "count": 0})
+        s["total_ms"] += c["duration_ms"]
+        s["count"] += 1
+    timing = {
+        "test_total_ms": round(sum(c["duration_ms"] for c in uniq), 3),
+        "by_suite": sorted(
+            ({"suite": k, "total_ms": round(v["total_ms"], 3), "count": v["count"]}
+             for k, v in by_suite.items()),
+            key=lambda x: x["total_ms"], reverse=True),
+        "slowest": [
+            {"test_name": c["test_name"], "class_name": c["class_name"],
+             "duration_ms": c["duration_ms"]}
+            for c in sorted(uniq, key=lambda c: c["duration_ms"], reverse=True)[:10]
+        ],
+    }
+
     summary = {
         "total": len(uniq),
         "passed": passed,
@@ -109,6 +136,7 @@ def main():
              "message": c["message"] or "test failed", "duration_ms": c["duration_ms"]}
             for c in uniq if c["failed"]
         ],
+        "timing": timing,
     }
     with open(summary_out, "w") as f:
         json.dump(summary, f)
