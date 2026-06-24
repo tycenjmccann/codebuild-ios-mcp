@@ -1,7 +1,7 @@
 [
   {
     "name": "ios_test",
-    "description": "Start an iOS build + test run on the CodeBuild macOS fleet for a given branch and scheme. Returns immediately with a build_id and status IN_PROGRESS. Poll ios_build_status with the build_id until the status is no longer IN_PROGRESS.",
+    "description": "Start an iOS build + test run on the CodeBuild macOS fleet for a given branch and scheme. Returns immediately with a build_id and status IN_PROGRESS. Then poll ios_build_status with the build_id until the status is no longer IN_PROGRESS. Expected wall time: ~10-15 min for a warm/incremental build (the default), longer for clean_build. Poll about every 60s; each poll is cheap and returns current_phase + phases[] so you can watch progress. Do NOT block on one long foreground sleep — many shells/harnesses kill a command at a ~120s timeout (exit 143), so the wait never actually elapses; instead sleep in short intervals (<=120s) between polls, or run the wait in the background.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -22,7 +22,7 @@
   },
   {
     "name": "ios_build_status",
-    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS with compute_size and the phase timeline. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with: compute_size (medium|large, where it ran), test_summary, per-test failures, a metrics object (compile count, cache_state cold/partial/warm, cache restore + save seconds, per-phase seconds, test timing) for warm/cold and cache diagnosis, and presigned artifact URLs: xcresult_url (full bundle zip), screenshots[] (every image captured by the test plus the final frame), assets_url (one zip of all visual evidence — images + session video — to download and unzip), session_video_url (whole-session mp4, present only if ios_test set record_session), and a CloudWatch logs link.",
+    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS with compute_size, current_phase, and a phases[] timeline (use these as the progress signal). Poll about every 60s in short waits rather than one long foreground sleep, which a ~120s command timeout will kill before it elapses. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with: compute_size (medium|large, where it ran), test_summary, per-test failures, a metrics object (compile count, cache_state cold/partial/warm, cache restore + save seconds, per-phase seconds, test timing) for warm/cold and cache diagnosis, and presigned artifact URLs: xcresult_url (full bundle zip), screenshots[] (every image captured by the test plus the final frame), assets_url (one zip of all visual evidence — images + session video — to download and unzip), session_video_url (whole-session mp4, present only if ios_test set record_session), and a CloudWatch logs link.",
     "inputSchema": {
       "type": "object",
       "properties": {
