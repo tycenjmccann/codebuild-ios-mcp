@@ -87,7 +87,7 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     // hardcoding the account id (derived from Stack.of(this).account).
     // ----------------------------------------------------------------------- //
     const projectName = 'ios-agent-tests';
-    const fleetName = 'ios-agent-tests-mac';
+    const fleetName = 'ios-agent-tests-mac-medium';
     const fleetNameLarge = 'ios-agent-tests-mac-large';
     const reportGroupName = `${projectName}-ios-test-report`;
     const lambdaName = 'codebuild-ios-mcp';
