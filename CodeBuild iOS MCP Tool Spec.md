@@ -538,7 +538,7 @@ Agent receives structured result:
 - **Screenshot diff:** Compare screenshots against baseline images, return visual diff
 - **Code coverage delta:** Return coverage % change vs main branch
 - ~~**Caching:** Persist DerivedData between builds for faster subsequent runs~~ — DONE: warm DerivedData + resolved SPM persist in `$HOME/ios-mcp-state` on the always-on reserved Mac (no CodeBuild cache feature; see buildspec)
-- **XCUITest video recording:** `xcrun simctl io booted recordVideo` for full test session recording
+- ~~**XCUITest video recording:** `xcrun simctl io booted recordVideo` for full test session recording~~ — DONE: `record_session: true` on `ios_test` records the whole simulator display to `session.mp4` (OS-level, independent of XCUITest captures). The buildspec also always extracts every `XCTAttachment` image from the xcresult and bundles all visual evidence into `builds/<id>/assets.zip` (returned as `artifacts.assets_url`); images are also served individually via `artifacts.screenshots[]`.
 - **AgentCore Gateway registration:** Register this MCP server as an AgentCore Gateway tool for multi-agent access
 
 ---

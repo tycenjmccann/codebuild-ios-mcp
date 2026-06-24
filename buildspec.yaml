@@ -15,6 +15,7 @@ env:
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
     CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build; warm state untouched
+    RECORD_SESSION: ""  # "true" (per-call ios_test arg) records the whole simulator display to session.mp4
 
 phases:
   build:
@@ -98,6 +99,18 @@ phases:
             echo "ERROR: package dependency resolution failed (see above)"; return 65
           fi
           TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
+
+          # --- optional whole-session video (RECORD_SESSION=true) ---
+          # OS-level capture of the simulator display, independent of whatever the
+          # XCUITest captures into the xcresult. Recorder runs in the background;
+          # SIGINT (not KILL) lets simctl finalize a playable mp4.
+          REC_PID=""
+          if [ "$RECORD_SESSION" = "true" ]; then
+            echo "Recording session -> session.mp4"
+            xcrun simctl io "$DEST_ID" recordVideo --codec h264 --force "$CODEBUILD_SRC_DIR/session.mp4" &
+            REC_PID=$!
+          fi
+
           echo "=== xcodebuild test ==="
           xcodebuild test \
             "${CONTAINER[@]}" \
@@ -107,7 +120,13 @@ phases:
             "${TESTPLAN_ARG[@]}" \
             "${DERIVED_ARGS[@]}" \
             -enableCodeCoverage YES
-          return ${PIPESTATUS[0]}
+          RC=${PIPESTATUS[0]}
+
+          if [ -n "$REC_PID" ]; then
+            kill -INT "$REC_PID" 2>/dev/null || true
+            wait "$REC_PID" 2>/dev/null || true
+          fi
+          return $RC
         }
 
         run 2>&1 | tee "$LOG"
@@ -131,6 +150,68 @@ phases:
         if [ -d TestResults.xcresult ]; then
           ditto -c -k --sequesterRsrc --keepParent TestResults.xcresult TestResults.xcresult.zip || true
           aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
+        fi
+
+        # --- visual assets: extract whatever the test captured + bundle a
+        #     single downloadable assets.zip (images + session video) ---
+        # The agent can't run xcresulttool/ffmpeg (Linux Lambda), so the Mac does
+        # all extraction here and ships ready-to-view files. assets/ holds:
+        #   - every XCTAttachment image baked into the xcresult (per-test captures)
+        #   - screenshot_final.png (the post-run frame)
+        #   - session.mp4 (only if RECORD_SESSION=true)
+        # Images are ALSO copied to builds/<id>/screenshots/ so the existing
+        # ios_build_status / get_test_logs presigned URLs keep serving them.
+        ASSETS="$CODEBUILD_SRC_DIR/assets"; mkdir -p "$ASSETS"
+        if [ -d TestResults.xcresult ]; then
+          # xcresulttool export attachments dumps every attachment + a manifest;
+          # filenames there are opaque, so rename images by their declared
+          # suggestedHumanReadableName from the manifest for readable evidence.
+          xcrun xcresulttool export attachments \
+            --path TestResults.xcresult \
+            --output-path "$ASSETS/_raw" 2>/dev/null || true
+          python3 - "$ASSETS/_raw" "$ASSETS" <<'PY' || true
+        import json, os, shutil, sys
+        raw, out = sys.argv[1], sys.argv[2]
+        man = os.path.join(raw, "manifest.json")
+        if not os.path.isdir(raw) or not os.path.exists(man):
+            sys.exit(0)
+        data = json.load(open(man))
+        # manifest is a list of test entries, each with an "attachments" list
+        entries = data if isinstance(data, list) else data.get("attachments", [])
+        seen = {}
+        def emit(name, fn):
+            src = os.path.join(raw, fn)
+            if not os.path.isfile(src):
+                return
+            base = name or fn
+            # keep only viewable images; skip plists/logs/etc.
+            if not base.lower().endswith((".png", ".jpg", ".jpeg", ".heic")):
+                if fn.lower().endswith((".png", ".jpg", ".jpeg", ".heic")):
+                    base = base + os.path.splitext(fn)[1]
+                else:
+                    return
+            seen[base] = seen.get(base, 0) + 1
+            if seen[base] > 1:
+                stem, ext = os.path.splitext(base); base = f"{stem}_{seen[base]}{ext}"
+            shutil.copyfile(src, os.path.join(out, base))
+        for e in entries:
+            for a in (e.get("attachments") or []):
+                emit(a.get("suggestedHumanReadableName") or a.get("exportedFileName"),
+                     a.get("exportedFileName"))
+        PY
+          rm -rf "$ASSETS/_raw"
+        fi
+        [ -f screenshot_final.png ] && cp screenshot_final.png "$ASSETS/" || true
+        [ -f session.mp4 ] && cp session.mp4 "$ASSETS/" || true
+        # push extracted images to screenshots/ so presigned-URL tools serve them
+        for img in "$ASSETS"/*.png "$ASSETS"/*.jpg "$ASSETS"/*.jpeg "$ASSETS"/*.heic; do
+          [ -e "$img" ] && aws s3 cp "$img" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
+        done
+        [ -f session.mp4 ] && aws s3 cp session.mp4 "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/session.mp4" || true
+        # single downloadable bundle of all visual evidence
+        if [ -n "$(ls -A "$ASSETS" 2>/dev/null)" ]; then
+          ditto -c -k --sequesterRsrc --keepParent "$ASSETS" assets.zip || true
+          aws s3 cp assets.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/assets.zip" || true
         fi
 
         # --- parse results: summary.json (authoritative, read by the Lambda) + JUnit (console) ---

@@ -33,6 +33,13 @@ test failures); while a build runs it returns a live CloudWatch log tail.
 - `buildspec.yaml` — build behavior. Read at synth time and embedded inline into
   the project; the iOS repo under test needs no buildspec. One shell block on
   purpose (CodeBuild runs each list item in a fresh CWD). Edit + redeploy.
+  Visual evidence: after tests it runs `xcresulttool export attachments` to pull
+  every `XCTAttachment` image out of the xcresult, bundles all images + final
+  frame + optional `session.mp4` into `builds/<id>/assets.zip`, and also drops the
+  images in `builds/<id>/screenshots/`. Extraction is Mac-side on purpose (the
+  Lambda is Linux, can't run xcresulttool/ffmpeg). `record_session: true` on
+  `ios_test` adds an OS-level `simctl recordVideo` of the whole sim — independent
+  of, and additive to, whatever the test itself captures.
 - `lambda/handler.py` — the six tools. Structured results are read from
   `s3://<bucket>/builds/<id>/summary.json`, NOT the CodeBuild Test Reports API
   (its JUnit parser silently drops cases). Keep this. Pre-test failures surface

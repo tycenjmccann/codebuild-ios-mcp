@@ -5,7 +5,8 @@ as MCP tools through an Amazon Bedrock AgentCore Gateway.
 
 An agent calls `ios_test(branch, scheme)`, polls `ios_build_status(build_id)`,
 and gets back a structured pass/fail summary, per-test failures, a phase timeline,
-presigned S3 artifact URLs (xcresult zip + screenshots), and a CloudWatch Logs
+presigned S3 artifact URLs (xcresult zip, screenshots, a single `assets.zip` of
+all visual evidence, and an optional whole-session video), and a CloudWatch Logs
 link. Four more tools round it out: `list_schemes`, `get_test_logs`,
 `get_build_log` (raw output + live log tail, including builds that fail before
 tests run), and `ios_cancel` (stop a runaway build). The design is async:
@@ -159,10 +160,11 @@ KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregiste
 The Gateway exposes the six tools defined in `gateway-tools.json`. The contract
 is async — start a build, then poll:
 
-1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build])`
+1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session])`
    → returns `{ status: "IN_PROGRESS", build_id }` immediately. `repo`/`project_dir`
    point the shared project at another app for this run; `clean_build: true` forces
-   a cold build (cache untouched).
+   a cold build (warm state untouched); `record_session: true` records the whole
+   simulator display to a `session.mp4` for this run.
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
@@ -172,7 +174,10 @@ is async — start a build, then poll:
      BUILD → … each with status + `duration_seconds`), so the agent can see *where*
      a slow build is and which phase failed — even while `IN_PROGRESS`.
    - Completed results include presigned `artifacts.xcresult_url`,
-     `artifacts.screenshots[]`, `artifacts.build_log_url`, and a
+     `artifacts.screenshots[]`, `artifacts.assets_url` (one zip of all visual
+     evidence — every image the test captured, the final frame, and the session
+     video if recorded), `artifacts.session_video_url` (present only when
+     `record_session` was set), `artifacts.build_log_url`, and a
      `artifacts.logs_url` CloudWatch link.
 3. `list_schemes(branch)` — schemes the buildspec published for that branch
    (written to `schemes/<branch>.json` on each run).
@@ -293,6 +298,32 @@ by device id, runs `xcodebuild test`, uploads a screenshot and
 `TestResults.xcresult.zip` to S3 under `builds/$CODEBUILD_BUILD_ID/`, and parses
 the xcresult into `builds/$CODEBUILD_BUILD_ID/summary.json` — the authoritative
 source for the structured `test_summary` / `failures` the tools return.
+
+### Visual evidence (screenshots & video)
+
+An agent can't run `xcresulttool`/`ffmpeg` (those are macOS-only; the Lambda is
+Linux), so the Mac does all extraction during the build and ships ready-to-view
+files. After tests run, the buildspec:
+
+- **Extracts every image the test captured.** `xcresulttool export attachments`
+  pulls each `XCTAttachment` out of the `.xcresult`, renamed to its
+  human-readable name. No app change needed — whatever the test attaches (failure
+  screenshots, per-step captures) comes out as a viewable PNG.
+- **Bundles one `assets.zip`** of all visual evidence — the extracted images, the
+  final-frame screenshot, and `session.mp4` if recorded — and uploads it to
+  `builds/<id>/assets.zip`. The agent downloads + unzips this once to *see* what
+  ran, with no Mac tooling. Individual images are also uploaded to
+  `builds/<id>/screenshots/`, so `artifacts.screenshots[]` and
+  `get_test_logs(...).screenshots[]` keep serving them as presigned URLs.
+- **Optionally records the whole session.** Pass `record_session: true` to
+  `ios_test` and the buildspec records the entire simulator display to
+  `session.mp4` (OS-level `simctl recordVideo`, independent of anything the test
+  captures). Returned as `artifacts.session_video_url` and included in the zip.
+  Off by default; reach for it when the test captures nothing of its own.
+
+Two layers, no conflict: what the **test** records lands in the xcresult and is
+always extracted; `record_session` adds an **OS-level** screen recording on top.
+Leave the flag off when the test already records itself.
 
 ### Connect builds to your private network (Nexus, internal services)
 

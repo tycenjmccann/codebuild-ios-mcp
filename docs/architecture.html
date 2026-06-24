@@ -85,7 +85,7 @@
       </div>
       <div class="sec req">
         <div class="h"><span class="n">5</span> Agent polls for results</div>
-        <ul><li>The agent polls <code>ios_build_status</code> with the <code>build_id</code> until the run finishes, then reads back <b>pass/fail, failing tests, and artifact links</b>.</li></ul>
+        <ul><li>The agent polls <code>ios_build_status</code> with the <code>build_id</code> until the run finishes, then reads back <b>pass/fail, failing tests, and artifact links</b> (xcresult, screenshots, and an <code>assets.zip</code> of all images + any session video).</li></ul>
       </div>
 
       <div class="grp opt">Add-ons (optional)</div>
@@ -101,7 +101,7 @@
       <div class="grp req" style="color:#1d6291">The MCP tools the agent gets</div>
       <div class="tools">
         <div class="tool"><b>ios_test</b><span>Start a build &amp; test run for a branch and scheme; returns a <code>build_id</code> to track it.</span></div>
-        <div class="tool"><b>ios_build_status</b><span>Get a run's status and results by <code>build_id</code>: pass/fail counts, failing tests, and artifact links.</span></div>
+        <div class="tool"><b>ios_build_status</b><span>Get a run's status and results by <code>build_id</code>: pass/fail counts, failing tests, and artifact links (xcresult, screenshots, <code>assets.zip</code>, session video).</span></div>
         <div class="tool"><b>list_schemes</b><span>List the schemes available on a branch so the agent can pick the right one.</span></div>
         <div class="tool"><b>get_test_logs</b><span>Get the detailed log and screenshot for a single failing test.</span></div>
         <div class="tool"><b>get_build_log</b><span>Watch the live log tail mid-build, or read the raw output when a build fails before tests run (compile or dependency errors).</span></div>
@@ -230,7 +230,7 @@
       <!-- s3 (regional, outside the VPC, top-right) -->
       <image href="./assets/aws/s3.png" x="848" y="150" width="58" height="58"/>
       <text class="ilab" x="877" y="226" text-anchor="middle">S3 · artifacts</text>
-      <text class="ilab2" x="877" y="241" text-anchor="middle">summary.json · xcresult</text>
+      <text class="ilab2" x="877" y="241" text-anchor="middle">summary · xcresult · assets.zip</text>
 
       <!-- subnet contents (CORE, inside optional VPC) -->
       <image href="./assets/aws/codebuild.png" x="424" y="380" width="58" height="58"/>

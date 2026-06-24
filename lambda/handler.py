@@ -45,6 +45,10 @@ def ios_test(args: dict) -> dict:
     # Use when an incremental build is suspect or for a guaranteed-clean run.
     if args.get("clean_build"):
         env.append({"name": "CLEAN_BUILD", "value": "true", "type": "PLAINTEXT"})
+    # Per-call session video: record the whole simulator display to session.mp4
+    # (OS-level, independent of any XCUITest capture). Off by default.
+    if args.get("record_session"):
+        env.append({"name": "RECORD_SESSION", "value": "true", "type": "PLAINTEXT"})
     # Per-call subdir override (multi-app on one shared project: each repo's
     # .xcworkspace/.xcodeproj may live in a different subdir).
     if args.get("project_dir"):
@@ -327,36 +331,32 @@ def _list_presigned(prefix: str):
     return urls
 
 
+def _presign_if_exists(key: str) -> str:
+    """Presigned GET URL for an S3 key, or '' if the object isn't there."""
+    try:
+        s3.head_object(Bucket=BUCKET, Key=key)
+    except Exception:
+        return ""
+    return s3.generate_presigned_url(
+        "get_object", Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=PRESIGN_TTL,
+    )
+
+
 def _get_artifact_urls(build_id: str) -> dict:
     prefix = f"builds/{build_id}"
-    xcresult_url = ""
-    # xcresult is uploaded as a zip for presignability (a .xcresult is a dir).
-    try:
-        s3.head_object(Bucket=BUCKET, Key=f"{prefix}/TestResults.xcresult.zip")
-        xcresult_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": BUCKET, "Key": f"{prefix}/TestResults.xcresult.zip"},
-            ExpiresIn=PRESIGN_TTL,
-        )
-    except Exception:
-        pass
     logs_url = (f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region="
                 f"{REGION}#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252F{PROJECT}")
-    build_log_url = ""
-    try:
-        s3.head_object(Bucket=BUCKET, Key=f"{prefix}/build_output.log")
-        build_log_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": BUCKET, "Key": f"{prefix}/build_output.log"},
-            ExpiresIn=PRESIGN_TTL,
-        )
-    except Exception:
-        pass
     return {
-        "xcresult_url": xcresult_url,
+        # xcresult is uploaded as a zip for presignability (a .xcresult is a dir).
+        "xcresult_url": _presign_if_exists(f"{prefix}/TestResults.xcresult.zip"),
         "screenshots": _list_presigned(f"{prefix}/screenshots/"),
+        # one bundle of all visual evidence (extracted images + session video):
+        # the agent downloads + unzips this to view what ran, no Mac tooling needed.
+        "assets_url": _presign_if_exists(f"{prefix}/assets.zip"),
+        # whole-session video, only present when ios_test set record_session=true.
+        "session_video_url": _presign_if_exists(f"{prefix}/session.mp4"),
         "logs_url": logs_url,
-        "build_log_url": build_log_url,
+        "build_log_url": _presign_if_exists(f"{prefix}/build_output.log"),
     }
 
 

@@ -12,14 +12,15 @@
         "test_plan": { "type": "string", "description": "Optional test plan name (empty = default)" },
         "repo": { "type": "string", "description": "Optional GitHub repo URL to build (multi-app: point the shared project at this repo for this run). Omit to use the project's configured repo." },
         "project_dir": { "type": "string", "description": "Optional subdir holding the .xcworkspace/.xcodeproj (e.g. 'ios'). Omit to use the project default." },
-        "clean_build": { "type": "boolean", "description": "Force a cold build for this run using a throwaway DerivedData (the warm build state on the reserved Mac is left intact for the next run). Builds are incremental by default; set true when an incremental build looks wrong or for a guaranteed-clean validation run." }
+        "clean_build": { "type": "boolean", "description": "Force a cold build for this run using a throwaway DerivedData (the warm build state on the reserved Mac is left intact for the next run). Builds are incremental by default; set true when an incremental build looks wrong or for a guaranteed-clean validation run." },
+        "record_session": { "type": "boolean", "description": "Record the entire simulator display to session.mp4 for this run (OS-level capture, independent of any screenshots/video the test itself takes). Off by default. The video is returned as a presigned URL in artifacts.session_video_url and included in artifacts.assets_url. Set true to get visual evidence when the test does not capture its own." }
       },
       "required": ["branch", "scheme"]
     }
   },
   {
     "name": "ios_build_status",
-    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with a test summary, per-test failures, and presigned artifact URLs (xcresult zip, screenshots, logs link).",
+    "description": "Check a CodeBuild build by id and return structured test results. While running, returns status IN_PROGRESS. When done, returns SUCCEEDED | FAILED | BUILD_ERROR | TIMED_OUT with a test summary, per-test failures, and presigned artifact URLs: xcresult_url (full bundle zip), screenshots[] (every image captured by the test plus the final frame), assets_url (one zip of all visual evidence — images + session video — to download and unzip), session_video_url (whole-session mp4, present only if ios_test set record_session), and a CloudWatch logs link.",
     "inputSchema": {
       "type": "object",
       "properties": {
