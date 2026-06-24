@@ -21,6 +21,11 @@ PROJECT = os.environ["CODEBUILD_PROJECT"]
 BUCKET = os.environ["ARTIFACTS_BUCKET"]
 REPORT_GROUP_ARN = os.environ.get("REPORT_GROUP_ARN", "")
 PRESIGN_TTL = int(os.environ.get("PRESIGN_TTL_SEC", "3600"))
+# Fleet ARNs for per-call compute_size routing. The project binds to MEDIUM by
+# default; LARGE is reached via StartBuild fleetOverride. LARGE is empty when the
+# large fleet is not enabled in the stack.
+FLEET_MEDIUM_ARN = os.environ.get("FLEET_MEDIUM_ARN", "")
+FLEET_LARGE_ARN = os.environ.get("FLEET_LARGE_ARN", "")
 
 codebuild = boto3.client("codebuild", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
@@ -66,6 +71,21 @@ def ios_test(args: dict) -> dict:
         start["sourceTypeOverride"] = "GITHUB"
         start["sourceLocationOverride"] = repo
 
+    # Per-call compute size. MEDIUM (default) uses the project's bound fleet; LARGE
+    # routes this one build to the large fleet via StartBuild fleetOverride. Both
+    # are MAC_ARM with the same image, so only the fleet + compute type change.
+    size = (args.get("compute_size") or "medium").lower()
+    if size == "large":
+        if not FLEET_LARGE_ARN:
+            return {
+                "status": "ERROR",
+                "message": "compute_size=large requested but no large fleet is "
+                           "enabled (deploy with enableLarge). Retry with "
+                           "compute_size=medium.",
+            }
+        start["fleetOverride"] = {"fleetArn": FLEET_LARGE_ARN}
+        start["computeTypeOverride"] = "BUILD_GENERAL1_LARGE"
+
     resp = codebuild.start_build(**start)
     build_id = resp["build"]["id"]
     return {
@@ -73,6 +93,7 @@ def ios_test(args: dict) -> dict:
         "build_id": build_id,
         "message": f"Build started on branch '{branch}'"
                    + (f" (repo {repo})" if repo else "")
+                   + f" ({size})"
                    + ". Poll ios_build_status with this build_id.",
     }
 

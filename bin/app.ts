@@ -32,10 +32,17 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   sourceVersion: ctx<string>('sourceVersion', 'main'),
   projectDir: ctx<string>('projectDir', '.'),
   defaultDevice: ctx<string>('defaultDevice', 'iPhone 17'),
-  // Concurrent build slots = always-on reserved Macs. Each one bills ~$25-30/day
-  // whether idle or not. 1 = sequential (builds queue); raise for a shared pool
-  // sized to PEAK concurrency, not headcount (cached builds are short + bursty).
+  // Concurrent build slots on the MEDIUM fleet = always-on reserved Macs. Each
+  // bills ~$25-30/day whether idle or not. 1 = sequential (builds queue); raise
+  // for a shared pool sized to PEAK concurrency, not headcount. Default 1; a 2nd
+  // also absorbs an AWS-side PROVISIONING fault with no 30-45 min re-provision
+  // wait. Scale per deploy: -c codebuild-ios-mcp:baseCapacity=N.
   baseCapacity: Math.max(1, Number(ctx<number>('baseCapacity', 1))),
+  // Provision a LARGE fleet alongside MEDIUM (default on). Disable with
+  // -c codebuild-ios-mcp:enableLarge=false. Pick size per build via
+  // ios_test(compute_size:"large"). Scale slots with -c ...:largeBaseCapacity=N.
+  enableLarge: bool(ctx<unknown>('enableLarge', true), true),
+  largeBaseCapacity: Math.max(1, Number(ctx<number>('largeBaseCapacity', 1))),
   artifactRetentionDays: Number(ctx<number>('artifactRetentionDays', 14)),
   presignTtlSec: Number(ctx<number>('presignTtlSec', 3600)),
   // Optional VPC wiring — populate to reach private resources (Nexus, internal

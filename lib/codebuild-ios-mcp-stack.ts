@@ -29,6 +29,15 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
    * team headcount. Default 1 (sequential).
    */
   readonly baseCapacity: number;
+  /**
+   * Also provision a LARGE MAC_ARM fleet (Apple M2 32 GB / 12 vCPU) alongside the
+   * default MEDIUM (24 GB / 8 vCPU). Callers route per build via
+   * ios_test(compute_size:"large"). When false, only MEDIUM exists and a large
+   * request returns a graceful error.
+   */
+  readonly enableLarge: boolean;
+  /** Concurrent build slots on the LARGE fleet (ignored when enableLarge=false). */
+  readonly largeBaseCapacity: number;
   /** Days before objects under builds/ expire in the artifacts bucket. */
   readonly artifactRetentionDays: number;
   /** TTL (seconds) for presigned artifact URLs returned by the Lambda. */
@@ -79,6 +88,7 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     // ----------------------------------------------------------------------- //
     const projectName = 'ios-agent-tests';
     const fleetName = 'ios-agent-tests-mac';
+    const fleetNameLarge = 'ios-agent-tests-mac-large';
     const reportGroupName = `${projectName}-ios-test-report`;
     const lambdaName = 'codebuild-ios-mcp';
     const bucketName = `ios-agent-test-artifacts-${this.account}`;
@@ -100,6 +110,16 @@ export class CodebuildIosMcpStack extends cdk.Stack {
           enabled: true,
           prefix: 'builds/',
           expiration: cdk.Duration.days(props.artifactRetentionDays),
+        },
+        {
+          // Warm-build cache (DerivedData + SPM + stable src) is overwritten on
+          // every build under a per-repo key, so this only reaps tarballs for
+          // repos that stopped building. 30d of inactivity = safe to drop (next
+          // build just recompiles cold once and reseeds).
+          id: 'expire-stale-warm-cache',
+          enabled: true,
+          prefix: 'warm-cache/',
+          expiration: cdk.Duration.days(30),
         },
       ],
     });
@@ -222,6 +242,11 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       }
     }
 
+    // Two MAC_ARM fleets so callers can pick a size per build via StartBuild's
+    // fleetOverride (a MAC_ARM fleet can't change computeType in place, so size
+    // is expressed as separate fleets, not one mutable fleet). The project binds
+    // to MEDIUM as its default; LARGE is reached only via per-call fleetOverride
+    // in the Lambda. Both share image / env type / overflow / VPC config.
     const fleet = new codebuild.CfnFleet(this, 'MacArmFleet', {
       name: fleetName,
       baseCapacity: props.baseCapacity,
@@ -232,6 +257,20 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       fleetServiceRole: fleetServiceRoleArn,
       fleetVpcConfig,
     });
+
+    // Optional LARGE fleet (M2 32GB/12vCPU). Gated by enableLarge so it can be
+    // dropped to stop its billing. Reached via compute_size:"large" on ios_test.
+    const fleetLarge = props.enableLarge
+      ? new codebuild.CfnFleet(this, 'MacArmFleetLarge', {
+          name: fleetNameLarge,
+          baseCapacity: props.largeBaseCapacity,
+          computeType: 'BUILD_GENERAL1_LARGE',
+          environmentType: 'MAC_ARM',
+          overflowBehavior: 'QUEUE',
+          fleetServiceRole: fleetServiceRoleArn,
+          fleetVpcConfig,
+        })
+      : undefined;
 
     // ----------------------------------------------------------------------- //
     // CodeBuild service role: scoped to its log group, the artifacts bucket,
@@ -347,6 +386,10 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         CODEBUILD_PROJECT: project.projectName,
         ARTIFACTS_BUCKET: artifactsBucket.bucketName,
         PRESIGN_TTL_SEC: String(props.presignTtlSec),
+        // Fleet ARNs for per-call compute_size routing via StartBuild fleetOverride.
+        // MEDIUM is the project default; LARGE empty when the large fleet is off.
+        FLEET_MEDIUM_ARN: fleet.attrArn,
+        FLEET_LARGE_ARN: fleetLarge ? fleetLarge.attrArn : '',
         // AWS_REGION is reserved/auto-populated by the Lambda runtime.
       },
     });
@@ -419,8 +462,14 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'FleetArn', {
       value: fleet.attrArn,
-      description: 'MAC_ARM reserved fleet ARN.',
+      description: 'MAC_ARM reserved fleet ARN (MEDIUM, project default).',
     });
+    if (fleetLarge) {
+      new cdk.CfnOutput(this, 'FleetArnLarge', {
+        value: fleetLarge.attrArn,
+        description: 'MAC_ARM reserved fleet ARN (LARGE, via compute_size:large).',
+      });
+    }
     new cdk.CfnOutput(this, 'LambdaArn', {
       value: fn.functionArn,
       description: 'MCP tools Lambda ARN (the AgentCore Gateway target).',
