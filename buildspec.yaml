@@ -100,8 +100,11 @@ phases:
           # mtime, which would re-dirty everything). Restored-from-S3 content keeps
           # its old mtimes; only genuinely changed files get copied -> only those
           # recompile. Source is mirrored AFTER restore so the checkout wins on diff.
+          # .git IS mirrored (no --exclude): Run Script phases / SPM plugins that
+          # shell out to git for version stamping need it, and git objects are
+          # content-addressed so --checksum skips unchanged ones cheaply.
           echo "Mirroring source -> $STABLE_SRC (stable path for warm incremental)"
-          rsync -a --checksum --delete --exclude '.git' "$CODEBUILD_SRC_DIR/" "$STABLE_SRC/"
+          rsync -a --checksum --delete "$CODEBUILD_SRC_DIR/" "$STABLE_SRC/"
           mark mirrored
           cd "$STABLE_SRC/$PROJECT_DIR" || { echo "ERROR: PROJECT_DIR '$PROJECT_DIR' not found under $STABLE_SRC"; return 1; }
 

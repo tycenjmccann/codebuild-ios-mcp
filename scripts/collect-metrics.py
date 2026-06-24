@@ -46,10 +46,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, default=24)
     ap.add_argument("--project", default="ios-agent-tests")
-    ap.add_argument("--bucket", default="ios-agent-test-artifacts-838829463875")
+    ap.add_argument("--bucket", default=None,
+                    help="Artifacts bucket. Default: ios-agent-test-artifacts-<account> "
+                         "derived from the caller's STS identity (no hardcoded account).")
     ap.add_argument("--region", default="us-east-1")
     ap.add_argument("--out", default="results.md")
     args = ap.parse_args()
+
+    # Derive the bucket from the caller's own account so this works in any account
+    # (the stack names it ios-agent-test-artifacts-<account>). Repo runbook forbids
+    # hardcoded account ids.
+    if not args.bucket:
+        ident = aws_json(["sts", "get-caller-identity", "--output", "json"]) or {}
+        acct = ident.get("Account")
+        if not acct:
+            sys.exit("Could not resolve account from STS; pass --bucket explicitly.")
+        args.bucket = f"ios-agent-test-artifacts-{acct}"
 
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)
 
