@@ -193,19 +193,28 @@ phases:
           # --- save warm state to S3 so any sibling Mac warms from it next time ---
           # CONDITIONAL: the tar+gzip+upload costs minutes, so only pay it when it
           # buys something. Upload when EITHER:
-          #   - the build produced output newer than BUILD_SENTINEL (DerivedData
-          #     changed -> S3 is now stale), OR
+          #   - COMPILED output changed since BUILD_SENTINEL (real recompile -> S3
+          #     stale), OR
           #   - S3 had no cache for this repo yet (must seed it once so siblings can
           #     restore), regardless of whether this run recompiled.
-          # A warm-local re-run that changed nothing AND already has an S3 copy
-          # skips the upload entirely -> no tax on the fast path.
+          # We look ONLY at compiled artifacts (.o/.swiftmodule/.swiftdoc and the
+          # Build/Products tree), NOT all of DerivedData: every run rewrites
+          # volatile files (Logs/, coverage, Index.noindex, .xcresult) that have
+          # nothing to do with the warm compile cache, and keying off those fired
+          # the save on every warm run (~160-200s tax for nothing). A true warm
+          # re-run touches no compiled artifact -> skips the upload entirely.
           # Skipped for clean builds (throwaway DerivedData). Saved even on test
           # failure: compile state is valid + reusable; only the test outcome differs.
           if [ "$CLEAN_BUILD" != "true" ]; then
             CHANGED=0
-            [ -n "$(find "$DERIVED" -type f -newer "$BUILD_SENTINEL" -print -quit 2>/dev/null)" ] && CHANGED=1
+            for d in "$DERIVED/Build/Products" "$DERIVED/Build/Intermediates.noindex"; do
+              [ -d "$d" ] || continue
+              if [ -n "$(find "$d" -type f \( -name '*.o' -o -name '*.swiftmodule' -o -name '*.swiftdoc' -o -name '*.dylib' -o -name '*.a' -o -name '*.app' \) -newer "$BUILD_SENTINEL" -print -quit 2>/dev/null)" ]; then
+                CHANGED=1; break
+              fi
+            done
             if [ "$CHANGED" = "1" ] || [ "$S3_HAD_CACHE" = "0" ]; then
-              REASON=$([ "$CHANGED" = "1" ] && echo "output changed" || echo "seeding empty S3 cache")
+              REASON=$([ "$CHANGED" = "1" ] && echo "compiled output changed" || echo "seeding empty S3 cache")
               echo "Saving warm cache -> $S3_CACHE ($REASON)"
               T0=$(date +%s)
               if tar -c -C "$WARM_ROOT" "$SRC_KEY" 2>/dev/null | gzip -1 2>/dev/null | aws s3 cp - "$S3_CACHE" 2>/dev/null; then
