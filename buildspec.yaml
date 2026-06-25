@@ -98,21 +98,21 @@ phases:
           fi
           mark restored
 
-          # Source-content hash (Layer 1 of the save gate). Hash SOURCE files only,
-          # computed now (post-mirror, pre-build) so it reflects what the agent
-          # actually checked out. Generated files (GeneratedAssetSymbols.swift and
-          # everything under DerivedSources/) are NOT hashed, so the per-run asset-
-          # catalog churn that recompiles a fixed ~69-file floor does NOT change the
-          # hash. At save time we compare to the hash stored beside the S3 tar: same
-          # hash => source unchanged => skip the ~160-200s re-upload. Prefer the AWS
-          # codebuild-hash-files tool; fall back to a sorted shasum if it's absent.
+          # Source identity (Layer 1 of the save gate). The build is a checkout at a
+          # known git commit, so the commit SHA fully identifies the source — far more
+          # stable than hashing the filesystem (which churns: SPM rewrites
+          # Package.resolved, generated files land in the tree, mtimes shift), which is
+          # why an earlier file-glob hash drifted between two identical-source runs and
+          # the skip never fired. Prefer CodeBuild's resolved commit; fall back to the
+          # git HEAD of the mirrored .git, then to a sorted source shasum for non-git
+          # sources. At save time we compare to the value stored beside the S3 tar:
+          # same SHA => source unchanged => skip the ~160-200s re-upload.
           S3_HASH="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.hash"
-          if command -v codebuild-hash-files >/dev/null 2>&1; then
-            SRC_HASH=$(cd "$STABLE_SRC" && codebuild-hash-files \
-              '**/*.swift' '**/*.h' '**/*.m' '**/*.mm' '**/*.c' '**/*.cpp' \
-              '**/Package.resolved' '**/*.pbxproj' 2>/dev/null || echo "")
+          SRC_HASH="${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"
+          if [ -z "$SRC_HASH" ]; then
+            SRC_HASH=$(git -C "$STABLE_SRC" rev-parse HEAD 2>/dev/null || echo "")
           fi
-          if [ -z "${SRC_HASH:-}" ]; then
+          if [ -z "$SRC_HASH" ]; then
             SRC_HASH=$(cd "$STABLE_SRC" && find . -type f \
               \( -name '*.swift' -o -name '*.h' -o -name '*.m' -o -name '*.mm' \
                  -o -name '*.c' -o -name '*.cpp' -o -name 'Package.resolved' \
