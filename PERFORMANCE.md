@@ -6,17 +6,27 @@ drives them, and how to size a fleet so you are not stuck in a queue.
 
 > ## 📇 Battle card
 >
-> | Scenario | Build | Test | Total* | When you hit it |
-> |---|---|---|---|---|
-> | **Warm — same instance** | ~370–530s | ~230–245s | **~10 min** | repo already built on that Mac |
-> | **Warm — restored from S3** | ~570–620s | ~245s | ~14 min | any Mac in the fleet, after one cold seed |
-> | **Cold — large** | ~736s | ~230s | ~16 min | first build on a fresh large Mac |
-> | **Cold — medium** | ~1,330s | ~245s | ~22 min | first build on a fresh medium Mac |
-> | **Local — warm** (reference) | — | ~137s | ~6 min | engineer's own Mac, incremental |
+> | Size | Cache state | Queue | Build | Test | **Total** |
+> |---|---|---|---|---|---|
+> | **Large** | Cold (first build) | 0 | ~12 min | ~4 min | **~16 min** |
+> | **Large** | S3 cache restored | 0 | ~10 min | ~4 min | **~14 min** |
+> | **Large** | Warm, same instance | 0 | ~8 min | ~4 min | **~12 min** |
+> | **Medium** | Cold (first build) | 0 | ~22 min | ~4 min | **~26 min** |
+> | **Medium** | S3 cache restored | 0 | ~10 min | ~4 min | **~14 min** |
+> | **Medium** | Warm, same instance | 0 | ~9 min | ~4 min | **~13 min** |
+> | Local (reference) | Warm | 0 | — | ~2 min | **~6 min** |
 >
-> \*Total excludes queue wait (see [Capacity](#capacity--queueing-read-this)).
-> Reference workload: a real iOS UI suite (Amplify + LiveKit + AWS SDK,
-> ~2,900 Swift files cold), 11 executed / 15 skipped, **11/0/15 every run**.
+> Queue = 0 assumes a free Mac. On a busy fleet add **~13 min per build already
+> ahead of you** (capacity = 1 → one build at a time). See
+> [Capacity](#capacity--queueing-read-this).
+>
+> Reference workload: a real iOS UI test suite on a large app — Swift Package
+> Manager dependency graph (Amplify + LiveKit + AWS SDK), **~2,900 Swift files
+> on a cold compile**. Your numbers scale with your app's size and dependencies.
+>
+> **Why the rows differ:** test time is fixed (~4 min) everywhere — the build is
+> the only variable. Cold recompiles all ~2,900 files; warm recompiles ~50–110.
+> Large beats medium only on a cold compile (more cores); once warm they match.
 >
 > **What to expect**
 > - **Test time is constant (~230–245s) no matter where it runs.** Cloud
@@ -60,17 +70,10 @@ runs when it buys something. Two independent gates, either can veto:
 
 Seeding always wins: an empty S3 cache is populated once so siblings can restore.
 
-### Verified — 8-run warm campaign (TheBudget, 4 medium ∥ 4 large)
-
-Every run restored warm and **skipped the save** (`source unchanged`):
-
-| size | runs | recompiled | restore | test | **save** | total |
-|---|---|---|---|---|---|---|
-| medium | 4 | 109 | 0–1s | ~733s | **0s** | ~743s |
-| large | 4 | 113 | 0–1s | ~732s | **0s** | ~742s |
-
-Before the fix, each of these would have spent ~160–200s re-uploading an
-unchanged cache. After: **0s**, on all 8.
+Across repeated warm runs on both fleet sizes, an unchanged commit recompiles
+only a small floor (~100 files) and the save gate **skips the upload entirely**
+(`source unchanged`, **0s**) — versus the ~160–200s every warm build spent
+re-uploading the cache before the gate existed.
 
 ---
 
@@ -129,6 +132,6 @@ explain a run:
 - `cache_saved` + `save_reason` — whether this run paid the save tax and why.
 - `sec_restore` / `sec_mirror` / `sec_test` / `sec_save` / `sec_total` — phase
   timing.
-- `tests_total/passed/failed/skipped`, `test_total_ms`.
+- test counts + total test duration.
 
 Harvest across every run with `scripts/collect-metrics.py`.
