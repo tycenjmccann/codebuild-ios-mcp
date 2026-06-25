@@ -98,14 +98,24 @@ def ios_test(args: dict) -> dict:
     env.append({"name": "COMPUTE_SIZE", "value": size, "type": "PLAINTEXT"})
 
     resp = codebuild.start_build(**start)
-    build_id = resp["build"]["id"]
+    build = resp["build"]
+    build_id = build["id"]
+    # Echo the RESOLVED source so a caller never has to guess what the run
+    # actually checked out. `repo`/`project_dir` are optional and fall back to
+    # deployment-level defaults that do NOT adapt per-caller; surfacing the
+    # resolved values here (and in BUILD_ERROR output) is what turns a silent
+    # cross-repo/wrong-subdir mismatch into an obvious one. See issue #2.
+    resolved_repo, resolved_dir, resolved_branch = _resolved_source(build)
     return {
         "status": "IN_PROGRESS",
         "build_id": build_id,
-        "message": f"Build started on branch '{branch}'"
-                   + (f" (repo {repo})" if repo else "")
-                   + f" ({size})"
-                   + ". Poll ios_build_status with this build_id.",
+        "repo": resolved_repo,
+        "project_dir": resolved_dir,
+        "branch": resolved_branch,
+        "compute_size": size,
+        "message": f"Build started: branch '{resolved_branch}', repo {resolved_repo}, "
+                   f"project_dir '{resolved_dir}' ({size}). "
+                   "Poll ios_build_status with this build_id.",
     }
 
 
@@ -143,6 +153,17 @@ def ios_build_status(args: dict) -> dict:
         tail = _get_error_tail(build_id)
         if tail:
             build_errors.append(tail)
+        # Lead with the resolved source. The two most common pre-test failures
+        # are a branch that doesn't exist on the (defaulted) repo and a
+        # PROJECT_DIR that isn't in the tree; CodeBuild's own messages name
+        # neither, so we prepend what was actually attempted. See issue #2.
+        resolved_repo, resolved_dir, resolved_branch = _resolved_source(build)
+        build_errors.insert(
+            0,
+            f"Attempted: checkout branch '{resolved_branch}' on repo {resolved_repo}, "
+            f"build project_dir '{resolved_dir}'. If this repo/branch/subdir is wrong, "
+            f"pass repo / branch / project_dir explicitly to ios_test.",
+        )
         status = "BUILD_ERROR"
     if cb_status == "TIMED_OUT":
         status = "TIMED_OUT"
@@ -319,6 +340,28 @@ def ios_list_builds(args: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _resolved_source(build: dict):
+    """Resolve the (repo, project_dir, branch) a build actually used.
+
+    `repo` and `project_dir` are optional on ios_test and fall back to
+    deployment-level defaults (a fixed GitHub source + the project's PROJECT_DIR,
+    typically '.'), which do NOT adapt to the caller. batch_get_builds /
+    start_build both report the effective source after overrides are applied, so
+    we read it back rather than echo the request. See issue #2.
+    """
+    source = build.get("source", {}) or {}
+    repo = source.get("location") or "(project default repo)"
+    branch = build.get("sourceVersion") or build.get("resolvedSourceVersion") or "(default branch)"
+    # PROJECT_DIR shows up in the resolved env only when overridden per-call;
+    # otherwise the buildspec's own default ('.') applies.
+    project_dir = "(project default, '.' unless set in buildspec)"
+    for var in build.get("environment", {}).get("environmentVariables", []):
+        if var.get("name") == "PROJECT_DIR" and var.get("value"):
+            project_dir = var["value"]
+            break
+    return repo, project_dir, branch
+
+
 def _duration(build: dict) -> int:
     start = build.get("startTime")
     end = build.get("endTime")
