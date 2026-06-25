@@ -58,6 +58,12 @@ def ios_test(args: dict) -> dict:
     # .xcworkspace/.xcodeproj may live in a different subdir).
     if args.get("project_dir"):
         env.append({"name": "PROJECT_DIR", "value": args["project_dir"], "type": "PLAINTEXT"})
+    # Per-repo warm-cache save floor: skip the S3 re-upload when this run recompiled
+    # fewer than N files (just the repo's fixed asset-catalog churn floor, not a real
+    # source change). Layer 2 of the save gate; Layer 1 (source hash) runs always.
+    if args.get("cache_save_threshold") is not None:
+        env.append({"name": "CACHE_SAVE_THRESHOLD",
+                    "value": str(int(args["cache_save_threshold"])), "type": "PLAINTEXT"})
 
     start = {
         "projectName": PROJECT,

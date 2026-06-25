@@ -88,11 +88,29 @@ phases:
           fi
           mark restored
 
-          # Sentinel to detect whether this build actually changed compiled output.
-          # If nothing newer than this marker lands in DerivedData, the warm state
-          # is identical to what's already in S3 -> skip the multi-minute re-upload.
-          BUILD_SENTINEL="$REPO_STATE/.last_build_marker"
-          touch "$BUILD_SENTINEL"
+          # Source-content hash (Layer 1 of the save gate). Hash SOURCE files only,
+          # computed now (post-mirror, pre-build) so it reflects what the agent
+          # actually checked out. Generated files (GeneratedAssetSymbols.swift and
+          # everything under DerivedSources/) are NOT hashed, so the per-run asset-
+          # catalog churn that recompiles a fixed ~69-file floor does NOT change the
+          # hash. At save time we compare to the hash stored beside the S3 tar: same
+          # hash => source unchanged => skip the ~160-200s re-upload. Prefer the AWS
+          # codebuild-hash-files tool; fall back to a sorted shasum if it's absent.
+          S3_HASH="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.hash"
+          if command -v codebuild-hash-files >/dev/null 2>&1; then
+            SRC_HASH=$(cd "$STABLE_SRC" && codebuild-hash-files \
+              '**/*.swift' '**/*.h' '**/*.m' '**/*.mm' '**/*.c' '**/*.cpp' \
+              '**/Package.resolved' '**/*.pbxproj' 2>/dev/null || echo "")
+          fi
+          if [ -z "${SRC_HASH:-}" ]; then
+            SRC_HASH=$(cd "$STABLE_SRC" && find . -type f \
+              \( -name '*.swift' -o -name '*.h' -o -name '*.m' -o -name '*.mm' \
+                 -o -name '*.c' -o -name '*.cpp' -o -name 'Package.resolved' \
+                 -o -name '*.pbxproj' \) ! -path '*/DerivedSources/*' -print0 2>/dev/null \
+              | sort -z | xargs -0 shasum 2>/dev/null | shasum | awk '{print $1}')
+          fi
+          echo "Source hash: $SRC_HASH"
+          STORED_HASH=$(aws s3 cp "$S3_HASH" - 2>/dev/null || echo "")
 
           mkdir -p "$STABLE_SRC"
           # rsync --checksum is the key: unchanged files are skipped, so their
@@ -190,41 +208,65 @@ phases:
             wait "$REC_PID" 2>/dev/null || true
           fi
 
-          # --- save warm state to S3 so any sibling Mac warms from it next time ---
-          # CONDITIONAL: the tar+gzip+upload costs minutes, so only pay it when it
-          # buys something. Upload when EITHER:
-          #   - COMPILED output changed since BUILD_SENTINEL (real recompile -> S3
-          #     stale), OR
-          #   - S3 had no cache for this repo yet (must seed it once so siblings can
-          #     restore), regardless of whether this run recompiled.
-          # We look ONLY at compiled artifacts (.o/.swiftmodule/.swiftdoc and the
-          # Build/Products tree), NOT all of DerivedData: every run rewrites
-          # volatile files (Logs/, coverage, Index.noindex, .xcresult) that have
-          # nothing to do with the warm compile cache, and keying off those fired
-          # the save on every warm run (~160-200s tax for nothing). A true warm
-          # re-run touches no compiled artifact -> skips the upload entirely.
-          # Skipped for clean builds (throwaway DerivedData). Saved even on test
-          # failure: compile state is valid + reusable; only the test outcome differs.
+          # --- save warm state to S3, gated by TWO independent layers ------------
+          # The tar+gzip+upload costs ~160-200s, so only pay it when it buys
+          # something. Both layers must agree before we save (either can veto):
+          #
+          # Layer 1 (source-content hash): if SRC_HASH == the hash stored beside the
+          #   S3 tar, the checked-out source is byte-identical to what produced the
+          #   cached state -> nothing worth re-uploading. Generated files aren't in
+          #   the hash, so the per-run asset-catalog recompile floor never trips it.
+          # Layer 2 (per-repo compile floor, CACHE_SAVE_THRESHOLD): some repos
+          #   recompile a fixed N files every warm run (e.g. ~69 for TTM from the
+          #   asset catalog). If this run's recompiles fall below the repo-declared
+          #   threshold, it's just that floor -> skip even if Layer 1 disagreed.
+          #   COMPILES is counted as object/module artifacts newer than the sentinel
+          #   (the log isn't flushed yet inside run(), so we count files, not lines).
+          #
+          # Seeding always wins: if S3 has no cache yet we must upload once so a
+          # sibling Mac has something to restore, regardless of either layer.
+          # Skipped entirely for clean builds (throwaway DerivedData).
           if [ "$CLEAN_BUILD" != "true" ]; then
-            CHANGED=0
-            for d in "$DERIVED/Build/Products" "$DERIVED/Build/Intermediates.noindex"; do
+            COMPILES=0
+            for d in "$DERIVED/Build/Intermediates.noindex" "$DERIVED/Build/Products"; do
               [ -d "$d" ] || continue
-              if [ -n "$(find "$d" -type f \( -name '*.o' -o -name '*.swiftmodule' -o -name '*.swiftdoc' -o -name '*.dylib' -o -name '*.a' -o -name '*.app' \) -newer "$BUILD_SENTINEL" -print -quit 2>/dev/null)" ]; then
-                CHANGED=1; break
-              fi
+              n=$(find "$d" -type f \( -name '*.o' -o -name '*.swiftmodule' \) -newer "$BUILD_SENTINEL" 2>/dev/null | wc -l | tr -d ' ')
+              COMPILES=$(( COMPILES + n ))
             done
-            if [ "$CHANGED" = "1" ] || [ "$S3_HAD_CACHE" = "0" ]; then
-              REASON=$([ "$CHANGED" = "1" ] && echo "compiled output changed" || echo "seeding empty S3 cache")
-              echo "Saving warm cache -> $S3_CACHE ($REASON)"
+
+            SAVE=0; REASON=""
+            if [ "$S3_HAD_CACHE" = "0" ]; then
+              SAVE=1; REASON="seeding empty S3 cache"
+            elif [ "$SRC_HASH" != "$STORED_HASH" ]; then
+              SAVE=1; REASON="source changed"
+            else
+              REASON="source unchanged"
+            fi
+            # Layer 2 veto (never blocks the initial seed)
+            if [ "$SAVE" = "1" ] && [ "$S3_HAD_CACHE" = "1" ] \
+               && [ -n "${CACHE_SAVE_THRESHOLD:-}" ] && [ "$COMPILES" -lt "$CACHE_SAVE_THRESHOLD" ]; then
+              SAVE=0; REASON="below threshold ($COMPILES<$CACHE_SAVE_THRESHOLD)"
+            fi
+
+            CACHE_SAVED=false
+            if [ "$SAVE" = "1" ]; then
+              echo "Saving warm cache -> $S3_CACHE ($REASON; $COMPILES recompiled)"
               T0=$(date +%s)
               if tar -c -C "$WARM_ROOT" "$SRC_KEY" 2>/dev/null | gzip -1 2>/dev/null | aws s3 cp - "$S3_CACHE" 2>/dev/null; then
+                printf '%s' "$SRC_HASH" | aws s3 cp - "$S3_HASH" 2>/dev/null || true
+                CACHE_SAVED=true
                 echo "Warm cache saved in $(( $(date +%s) - T0 ))s"
               else
                 echo "WARNING: warm cache upload failed (non-fatal; next build may be cold)"
               fi
             else
-              echo "Warm state unchanged + S3 cache present -> skipping upload (no tax on warm path)"
+              echo "Skipping warm cache upload ($REASON; $COMPILES recompiled) - no tax on warm path"
             fi
+            # Expose the decision to the metrics block (written to a file since the
+            # metrics python runs outside this tee'd subshell).
+            printf 'src_hash=%s\ncache_saved=%s\nsave_reason=%s\ncompiles_artifacts=%s\n' \
+              "$SRC_HASH" "$CACHE_SAVED" "$REASON" "$COMPILES" \
+              > "$CODEBUILD_SRC_DIR/cache_decision.txt" 2>/dev/null || true
           fi
           mark saved
           return $RC
@@ -336,9 +378,10 @@ phases:
         # recomputed here (it was a run() local) identically to the run() version.
         METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR" | tr -c 'A-Za-z0-9._-' '_')
         python3 - "$LOG" "$PHASES" "$CODEBUILD_SRC_DIR/summary.json" \
-                 "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" <<'PY' || true
+                 "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" \
+                 "$CODEBUILD_SRC_DIR/cache_decision.txt" <<'PY' || true
         import json, re, sys
-        log, phases_f, summ_f, out, build_id, src_key = sys.argv[1:7]
+        log, phases_f, summ_f, out, build_id, src_key, cache_f = sys.argv[1:8]
         def secs(a, b, p):
             t = {}
             try:
@@ -356,6 +399,13 @@ phases:
         state = "cold" if compiles > 800 else ("warm" if compiles < 150 else "partial")
         try: summ = json.load(open(summ_f))
         except Exception: summ = {}
+        # Save-gate decision (written by the build phase): hash, saved?, reason.
+        cache = {}
+        try:
+            for ln in open(cache_f):
+                k, _, v = ln.strip().partition("=")
+                if k: cache[k] = v
+        except Exception: pass
         m = {
             "build_id": build_id,
             "repo": src_key,
@@ -363,6 +413,9 @@ phases:
             "stale": stale,
             "cache_restored_from_s3": restored,
             "cache_state": state,
+            "cache_saved": cache.get("cache_saved") == "true",
+            "save_reason": cache.get("save_reason"),
+            "src_hash": cache.get("src_hash"),
             "sec_restore": secs("start", "restored", phases_f),
             "sec_mirror": secs("restored", "mirrored", phases_f),
             "sec_test": secs("test_start", "test_end", phases_f),
