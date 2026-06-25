@@ -85,6 +85,21 @@ one shared project (agent passes `repo` + `project_dir` to `ios_test` per call)
 or one stack/project per app (isolated history). Gateway/Lambda/tools are
 unchanged either way.
 
+Two sizes, one project: the stack provisions a MEDIUM fleet (M2 24GB/8vCPU, the
+project default) and, when `enableLarge` (default true), a LARGE fleet (M2
+32GB/12vCPU). A MAC_ARM fleet can't change computeType in place, so size is two
+fleets; the caller picks per build with `ios_test(compute_size:"large")`, which
+routes that one build via StartBuild `fleetOverride` + `computeTypeOverride`. No
+2nd project/Lambda/gateway. Large may be `INSUFFICIENT_CAPACITY` in-region — a
+large request with no large fleet enabled returns an error so the agent retries
+medium (prefer-large/fallback-medium). Capacities are deploy-time:
+`-c codebuild-ios-mcp:baseCapacity=N` (medium, default 1),
+`-c codebuild-ios-mcp:largeBaseCapacity=N` (default 1),
+`-c codebuild-ios-mcp:enableLarge=false` to drop large. Each reserved Mac bills
+continuously at ~$25-30/day, so the default `enableLarge=true` (1 med + 1 large)
+is **two** billed Macs ≈ $50-60/day; set `enableLarge=false` for a single
+medium Mac ≈ $25-30/day.
+
 VPC (internal Nexus / validation services): add
 `-c codebuild-ios-mcp:vpcId=… -c codebuild-ios-mcp:subnetIds=a,b -c codebuild-ios-mcp:securityGroupIds=sg`.
 Endpoints (S3+Logs+CodeBuild) are auto-created for no-NAT subnets; add

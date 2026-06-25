@@ -17,6 +17,10 @@ This repo is the **CDK v2 (TypeScript)** packaging of that system: one
 `cdk deploy` provisions everything CloudFormation can model, and one CLI script
 (`scripts/register-gateway.sh`) finishes the AgentCore Gateway wiring.
 
+**Performance & what to expect:** see [`PERFORMANCE.md`](PERFORMANCE.md) — warm
+vs cold timings, how the size-scoped S3 warm cache works, and how to size a
+fleet so you are not stuck in a queue.
+
 ---
 
 ## Architecture
