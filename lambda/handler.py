@@ -285,8 +285,11 @@ def ios_cancel(args: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def ios_list_builds(args: dict) -> dict:
     limit = min(int(args.get("limit", 20)), 50)
+    # Omit sortOrder: the API already defaults to descending (newest-first), and
+    # PASSING sortOrder errors once a project has >100 builds. This stack
+    # accumulates many runs, so we rely on the default order.
     ids = codebuild.list_builds_for_project(
-        projectName=PROJECT, sortOrder="DESCENDING").get("ids", [])[:limit]
+        projectName=PROJECT).get("ids", [])[:limit]
     if not ids:
         return {"builds": [], "running": 0, "queued": 0}
     builds = codebuild.batch_get_builds(ids=ids).get("builds", [])
