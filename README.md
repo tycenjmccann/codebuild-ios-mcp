@@ -5,13 +5,16 @@ as MCP tools through an Amazon Bedrock AgentCore Gateway.
 
 An agent calls `ios_test(branch, scheme)`, polls `ios_build_status(build_id)`,
 and gets back a structured pass/fail summary, per-test failures, a phase timeline,
-presigned S3 artifact URLs (xcresult zip, screenshots, a single `assets.zip` of
-all visual evidence, and an optional whole-session video), and a CloudWatch Logs
-link. Four more tools round it out: `list_schemes`, `get_test_logs`,
-`get_build_log` (raw output + live log tail, including builds that fail before
-tests run), and `ios_cancel` (stop a runaway build). The design is async:
-`ios_test` starts the build and returns a `build_id` immediately, so every tool
-call stays well under Lambda/Gateway timeouts regardless of build duration.
+a `metrics` object (compile count, cache state, per-phase timing) and the
+`compute_size` it ran on, presigned S3 artifact URLs (xcresult zip, screenshots,
+a single `assets.zip` of all visual evidence, and an optional whole-session
+video), and a CloudWatch Logs link. Five more tools round it out: `list_schemes`,
+`get_test_logs`, `get_build_log` (raw output + live log tail, including builds
+that fail before tests run), `ios_list_builds` (pool/queue visibility — what's
+running vs queued on each fleet), and `ios_cancel` (stop a runaway build). The
+design is async: `ios_test` starts the build and returns a `build_id`
+immediately, so every tool call stays well under Lambda/Gateway timeouts
+regardless of build duration.
 
 This repo is the **CDK v2 (TypeScript)** packaging of that system: one
 `cdk deploy` provisions everything CloudFormation can model, and one CLI script
@@ -37,14 +40,18 @@ What `cdk deploy` creates:
   blocked, SSE-S3 encryption, SSL enforced, `builds/` expires after 14 days, and
   seeded with `tooling/xcresult_to_junit.py` (used by the buildspec to convert
   `.xcresult` to JUnit XML).
-- **MAC_ARM reserved CodeBuild fleet** — `BUILD_GENERAL1_MEDIUM`, image
-  `aws/codebuild/macos-arm-base:14`, `baseCapacity` (default 1), overflow `QUEUE`. Modeled
-  with `AWS::CodeBuild::Fleet` (`CfnFleet`) because no L2/L1 construct exists.
+- **MAC_ARM reserved CodeBuild fleet(s)** — Apple M2, image
+  `aws/codebuild/macos-arm-base:14`, `baseCapacity` (default 1), overflow `QUEUE`,
+  modeled with `AWS::CodeBuild::Fleet` (`CfnFleet`) since no L2/L1 construct exists.
+  A `BUILD_GENERAL1_MEDIUM` fleet (8 vCPU/24 GB) is the default; a
+  `BUILD_GENERAL1_LARGE` fleet (12 vCPU/32 GB) is also created by default
+  (`enableLarge`), and `ios_test(compute_size: "large")` routes a build to it via
+  `StartBuild` `fleetOverride` — one project, both sizes, no redeploy.
 - **CodeBuild project** `ios-agent-tests` — GITHUB source (your iOS repo), the
   buildspec embedded **inline** from `buildspec.yaml`, attached to the fleet,
   40-minute timeout, dedicated CloudWatch log group, auto-creates the
   `ios-agent-tests-ios-test-report` JUNITXML report group on first run.
-- **Lambda** `codebuild-ios-mcp` — the six MCP tools, least-privilege exec role.
+- **Lambda** `codebuild-ios-mcp` — the seven MCP tools, least-privilege exec role.
 - **Gateway invoke role** + a Lambda resource permission for the
   `bedrock-agentcore.amazonaws.com` principal, so the Gateway can invoke the
   Lambda once registered.
@@ -161,22 +168,29 @@ KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregiste
 
 ## How an agent uses it
 
-The Gateway exposes the six tools defined in `gateway-tools.json`. The contract
+The Gateway exposes the seven tools defined in `gateway-tools.json`. The contract
 is async — start a build, then poll:
 
-1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session])`
-   → returns `{ status: "IN_PROGRESS", build_id }` immediately. `repo`/`project_dir`
-   point the shared project at another app for this run; `clean_build: true` forces
-   a cold build (warm state untouched); `record_session: true` records the whole
-   simulator display to a `session.mp4` for this run.
+1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session], [compute_size], [cache_save_threshold])`
+   → returns `{ status: "IN_PROGRESS", build_id, repo, project_dir, branch, compute_size }`
+   immediately (the resolved `repo`/`project_dir`/`branch` are echoed back so a
+   wrong default is obvious). `repo`/`project_dir` point the shared project at
+   another app for this run; `clean_build: true` forces a cold build (warm state
+   untouched); `record_session: true` records the whole simulator display to a
+   `session.mp4`; `compute_size: "large"` routes this run to the large (Apple M2,
+   12 vCPU/32 GB) fleet instead of medium.
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
    - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`).
    - `TIMED_OUT` — build exceeded the 40-minute limit.
-   - Every response carries a `phases[]` timeline (DOWNLOAD_SOURCE → INSTALL →
-     BUILD → … each with status + `duration_seconds`), so the agent can see *where*
-     a slow build is and which phase failed — even while `IN_PROGRESS`.
+   - Every response carries `compute_size` (where it ran) and a `phases[]` timeline
+     (DOWNLOAD_SOURCE → INSTALL → BUILD → … each with status + `duration_seconds`),
+     so the agent can see *where* a slow build is and which phase failed — even
+     while `IN_PROGRESS`.
+   - Completed results add a `metrics` object — compile count, `cache_state`
+     (cold/partial/warm), cache restore + save seconds, per-phase seconds, test
+     timing — for warm/cold and cache diagnosis.
    - Completed results include presigned `artifacts.xcresult_url`,
      `artifacts.screenshots[]`, `artifacts.assets_url` (one zip of all visual
      evidence — every image the test captured, the final frame, and the session
@@ -194,7 +208,11 @@ is async — start a build, then poll:
    `build_output.log`. Reach for this to watch progress mid-build, and whenever
    `ios_build_status` returns `BUILD_ERROR` or `test_summary.total == 0` —
    `get_test_logs` can't help there because there are no named tests.
-6. `ios_cancel(build_id)` — stop a wrong or runaway build (`StopBuild`) and free
+6. `ios_list_builds([limit], [compute_size])` — recent builds with status, phase,
+   size, and timing, plus running/queued counts. CodeBuild has no per-build
+   "which instance" view, so this is how an agent driving several builds sees
+   queue depth on each fleet instead of polling build ids blind.
+7. `ios_cancel(build_id)` — stop a wrong or runaway build (`StopBuild`) and free
    the macOS fleet instead of waiting out the 40-minute timeout.
 
 Poll loop sketch:
@@ -279,7 +297,7 @@ no token vault, no client secret. Two requirements:
    ```
 
 2. Point the agent at `GATEWAY_URL` using the transport in
-   `examples/connect_agent.py`. The six tools auto-discover via `tools/list`.
+   `examples/connect_agent.py`. The seven tools auto-discover via `tools/list`.
 
 For interactive testing, point the
 [MCP Inspector](https://modelcontextprotocol.io/) at `GATEWAY_URL` with a SigV4
@@ -362,7 +380,7 @@ cdk deploy ... -c codebuild-ios-mcp:createVpcEndpoints=false
 
 The subnets still must route to your internal resources (Nexus, validation
 services) via your own NAT/Transit Gateway/peering. Nothing else changes — the
-same six MCP tools work whether or not the fleet is in a VPC.
+same seven MCP tools work whether or not the fleet is in a VPC.
 
 ### The fix → retest loop (warm builds)
 
@@ -450,7 +468,7 @@ aws codebuild delete-fleet --arn <FleetArn-from-outputs>
 .
 ├── bin/app.ts                       CDK app entrypoint; reads context, instantiates the stack
 ├── lib/codebuild-ios-mcp-stack.ts   the stack (bucket, fleet, project, Lambda, gateway role, outputs)
-├── lambda/handler.py                the six MCP tools (Gateway lambda target + direct test path)
+├── lambda/handler.py                the seven MCP tools (Gateway lambda target + direct test path)
 ├── tooling/xcresult_to_junit.py     xcresult -> JUnit converter, uploaded to s3://<bucket>/tooling/
 ├── buildspec.yaml                   embedded inline into the CodeBuild project (single source of truth)
 ├── gateway-tools.json               inline tool schema for the Gateway lambda target

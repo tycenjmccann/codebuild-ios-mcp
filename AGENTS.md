@@ -6,7 +6,7 @@ detail lives in `README.md`; this file is the terse, do-this sequence.
 ## What this is
 
 A CDK v2 (TypeScript) app that provisions an AWS CodeBuild **macOS (`MAC_ARM`)**
-iOS build+test runner and exposes it to agents as six MCP tools through a
+iOS build+test runner and exposes it to agents as seven MCP tools through a
 Bedrock AgentCore Gateway: `ios_test`, `ios_build_status`, `list_schemes`,
 `get_test_logs`, `get_build_log`, `ios_cancel`. Async contract: `ios_test`
 returns a `build_id`; poll `ios_build_status` until `status != "IN_PROGRESS"`
@@ -40,7 +40,7 @@ test failures); while a build runs it returns a live CloudWatch log tail.
   Lambda is Linux, can't run xcresulttool/ffmpeg). `record_session: true` on
   `ios_test` adds an OS-level `simctl recordVideo` of the whole sim — independent
   of, and additive to, whatever the test itself captures.
-- `lambda/handler.py` — the six tools. Structured results are read from
+- `lambda/handler.py` — the seven tools. Structured results are read from
   `s3://<bucket>/builds/<id>/summary.json`, NOT the CodeBuild Test Reports API
   (its JUnit parser silently drops cases). Keep this. Pre-test failures surface
   via `error_tail.txt` / `build_output.log` (also in `builds/<id>/`), read by
