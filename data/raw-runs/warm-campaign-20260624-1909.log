@@ -1,0 +1,20 @@
+warm-campaign start Wed Jun 24 19:09:25 PDT 2026
+19:09:28 [medium run1] started 
+[medium run1] FAILED TO START
+19:09:28 [large run1] started 
+[large run1] FAILED TO START
+19:09:30 [medium run2] started 
+[medium run2] FAILED TO START
+19:09:30 [large run2] started 
+[large run2] FAILED TO START
+19:09:33 [large run3] started 
+[large run3] FAILED TO START
+19:09:33 [medium run3] started 
+[medium run3] FAILED TO START
+19:09:35 [medium run4] started 
+[medium run4] FAILED TO START
+19:09:35 [large run4] started 
+[large run4] FAILED TO START
+19:09:35 [medium] TRACK COMPLETE
+19:09:35 [large] TRACK COMPLETE
+warm-campaign done Wed Jun 24 19:09:35 PDT 2026
