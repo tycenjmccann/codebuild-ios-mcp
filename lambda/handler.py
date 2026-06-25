@@ -91,6 +91,11 @@ def ios_test(args: dict) -> dict:
             }
         start["fleetOverride"] = {"fleetArn": FLEET_LARGE_ARN}
         start["computeTypeOverride"] = "BUILD_GENERAL1_LARGE"
+    # Tell the buildspec which fleet this run lands on so it scopes the S3 warm
+    # cache key by size. medium and large are separate fleets with separate Macs;
+    # a shared cache key makes them restore each other's DerivedData, which fails
+    # Swift's incremental validity check -> full recompile + mutual clobber.
+    env.append({"name": "COMPUTE_SIZE", "value": size, "type": "PLAINTEXT"})
 
     resp = codebuild.start_build(**start)
     build_id = resp["build"]["id"]

@@ -16,6 +16,10 @@ env:
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
     CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build; warm state untouched
     RECORD_SESSION: ""  # "true" (per-call ios_test arg) records the whole simulator display to session.mp4
+    COMPUTE_SIZE: "medium"  # fleet size this run lands on; scopes the S3 warm cache key so
+                            # medium and large (separate fleets, separate Macs) never restore
+                            # each other's DerivedData (cross-size restore fails Swift validity
+                            # -> full recompile + mutual clobber). Set by ios_test per call.
 
 phases:
   build:
@@ -62,7 +66,13 @@ phases:
           # Warm state is per-repo ($SRC_KEY) so multiple apps on the shared fleet
           # don't contaminate each other's DerivedData/SPM (the macOS-blog caution).
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
-          SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR" | tr -c 'A-Za-z0-9._-' '_' )
+          # SRC_KEY is scoped by repo + subdir + COMPUTE_SIZE. Size matters because
+          # medium and large are SEPARATE fleets: a large Mac restoring medium's tar
+          # (or vice versa) fails Swift's incremental validity check -> full recompile,
+          # then re-saves its own -> the two sizes endlessly clobber a shared key.
+          # Size in the key gives each fleet its own consistent cache; cross-instance
+          # warm then works reliably within a size (proven: medium->medium = 65 compiles).
+          SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_' )
           REPO_STATE="$WARM_ROOT/$SRC_KEY"
           STABLE_SRC="$REPO_STATE/src"
           S3_CACHE="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.tar.gz"
@@ -189,6 +199,13 @@ phases:
             xcrun simctl io "$DEST_ID" recordVideo --codec h264 --force "$CODEBUILD_SRC_DIR/session.mp4" &
             REC_PID=$!
           fi
+
+          # Sentinel for the post-build compile count (Layer 2 of the save gate +
+          # the compiles_artifacts metric). Touched immediately before xcodebuild,
+          # so any .o/.swiftmodule newer than it was produced by THIS run. Must be a
+          # real file: `find -newer ""` errors and silently yields 0.
+          BUILD_SENTINEL="$REPO_STATE/.build_sentinel"
+          mkdir -p "$REPO_STATE"; : > "$BUILD_SENTINEL"
 
           echo "=== xcodebuild test ==="
           mark test_start
@@ -376,7 +393,7 @@ phases:
         # Phase secs come from phase_times.txt; compile/stale counts + cache state
         # from the log; test counts from summary.json. All best-effort. SRC_KEY is
         # recomputed here (it was a run() local) identically to the run() version.
-        METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR" | tr -c 'A-Za-z0-9._-' '_')
+        METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_')
         python3 - "$LOG" "$PHASES" "$CODEBUILD_SRC_DIR/summary.json" \
                  "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" \
                  "$CODEBUILD_SRC_DIR/cache_decision.txt" <<'PY' || true
