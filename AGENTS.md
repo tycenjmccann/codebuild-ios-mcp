@@ -95,8 +95,10 @@ large request with no large fleet enabled returns an error so the agent retries
 medium (prefer-large/fallback-medium). Capacities are deploy-time:
 `-c codebuild-ios-mcp:baseCapacity=N` (medium, default 1),
 `-c codebuild-ios-mcp:largeBaseCapacity=N` (default 1),
-`-c codebuild-ios-mcp:enableLarge=false` to drop large. Default 1+1 ≈ $30/day;
-1 med + 1 large is two billed Macs.
+`-c codebuild-ios-mcp:enableLarge=false` to drop large. Each reserved Mac bills
+continuously at ~$25-30/day, so the default `enableLarge=true` (1 med + 1 large)
+is **two** billed Macs ≈ $50-60/day; set `enableLarge=false` for a single
+medium Mac ≈ $25-30/day.
 
 VPC (internal Nexus / validation services): add
 `-c codebuild-ios-mcp:vpcId=… -c codebuild-ios-mcp:subnetIds=a,b -c codebuild-ios-mcp:securityGroupIds=sg`.
