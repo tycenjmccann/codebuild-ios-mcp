@@ -25,23 +25,16 @@ phases:
   build:
     commands:
       - |
-        # No global `set -e`: scheme/device probing uses commands that return
-        # nonzero on "no match" (ls, grep), which would abort the run before
-        # xcodebuild ever ran. We capture the test exit code explicitly instead.
-        #
-        # ALL output (probing, dep resolve, compile, test) is tee'd to a single
-        # build_output.log, and that log + an error_tail.txt are ALWAYS uploaded
-        # to builds/<id>/ — even when the build fails before any test runs (bad
-        # PROJECT_DIR, scheme not found, compile/dep error). That is the contract
-        # the get_build_log tool reads, so the agent always sees the raw error.
+        # No global `set -e`: scheme/device probing (ls, grep) returns nonzero on
+        # "no match" and would abort before xcodebuild; we capture the test exit
+        # code explicitly. ALL output is tee'd to build_output.log, which + an
+        # error_tail.txt ALWAYS upload to builds/<id>/ even on pre-test failure --
+        # the contract get_build_log reads.
         LOG="$CODEBUILD_SRC_DIR/build_output.log"
 
-        # Everything below runs inside run() so we can pipe the whole thing to
-        # tee and still recover the real exit code via PIPESTATUS. Use `return`
-        # (never `exit`) inside run() so diagnostics upload regardless.
-        # Phase timing: run() executes in a subshell (piped to tee), so its vars
-        # don't survive to the metrics block below. Stamp boundaries into a file
-        # instead. mark <name> appends "<name> <epoch>"; the metrics block diffs them.
+        # run() is piped to tee; recover its exit via PIPESTATUS, use `return` not
+        # `exit` so diagnostics upload. run()'s subshell vars don't survive to the
+        # metrics block, so mark <name> stamps "<name> <epoch>" to a file to diff.
         PHASES="$CODEBUILD_SRC_DIR/phase_times.txt"; : > "$PHASES"
         mark() { echo "$1 $(date +%s)" >> "$PHASES"; }
 
@@ -51,20 +44,13 @@ phases:
           BRANCH="${BRANCH##refs/heads/}"
 
           # --- stable, per-repo warm state (instance-local + S3-backed) ----------
-          # Two problems this solves:
-          #  1) CodeBuild drops the checkout in a NEW /tmp/codebuild-<uuid>/ every
-          #     run. Swift bakes the absolute working-directory path into its
-          #     incremental state, so a moving source dir = cache miss = full
-          #     recompile every time, even with warm DerivedData. Fix: mirror the
-          #     checkout into one STABLE path ($HOME is /Users/cbuser on every
-          #     instance, so the path is identical fleet-wide) and build from there.
-          #  2) Reserved fleets have N Macs and NO build-to-instance affinity, so a
-          #     repo is only warm on whichever Mac it last ran on; landing on a
-          #     sibling = cold. Fix: back the warm state with S3 (AWS's documented
-          #     cross-host cache mechanism). Restore on a cold instance, save after.
-          #
-          # Warm state is per-repo ($SRC_KEY) so multiple apps on the shared fleet
-          # don't contaminate each other's DerivedData/SPM (the macOS-blog caution).
+          # 1) CodeBuild checks out to a NEW /tmp/codebuild-<uuid>/ each run; Swift
+          #    bakes the absolute working-dir into incremental state, so a moving src
+          #    = full recompile. Fix: mirror to a STABLE path ($HOME=/Users/cbuser,
+          #    identical fleet-wide) and build there.
+          # 2) Reserved fleets have no build-to-instance affinity; a repo is warm only
+          #    on the Mac it last ran on. Fix: back warm state with S3, restore on a
+          #    cold instance. Key is per-repo+size so apps/fleets don't contaminate.
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
           # SRC_KEY is scoped by repo + subdir + COMPUTE_SIZE. Size matters because
           # medium and large are SEPARATE fleets: a large Mac restoring medium's tar
@@ -78,12 +64,9 @@ phases:
           S3_CACHE="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.tar.gz"
 
           # Restore from S3 only when this instance is cold for this repo (no local
-          # DerivedData yet) and this is not a forced clean build. A warm local
-          # state is newer than S3, so we never clobber it on restore. gzip -1 +
-          # streamed tar: no temp-disk doubling, fast enough for object files.
-          # S3_HAD_CACHE drives the conditional save: if S3 has no copy yet we must
-          # seed it once even when this instance is warm-local (else a sibling Mac
-          # never gets a cache to restore).
+          # DerivedData) and not a forced clean build. Streamed tar + gzip -1: no
+          # temp-disk doubling. S3_HAD_CACHE gates the save: seed once if S3 is empty
+          # even when warm-local, else a sibling Mac has nothing to restore.
           S3_HAD_CACHE=0
           aws s3 ls "$S3_CACHE" >/dev/null 2>&1 && S3_HAD_CACHE=1
           if [ "$CLEAN_BUILD" != "true" ] && [ ! -d "$REPO_STATE/DerivedData" ]; then
@@ -123,14 +106,10 @@ phases:
           STORED_HASH=$(aws s3 cp "$S3_HASH" - 2>/dev/null || echo "")
 
           mkdir -p "$STABLE_SRC"
-          # rsync --checksum is the key: unchanged files are skipped, so their
-          # mtimes are preserved (a fresh git checkout stamps every file with a new
-          # mtime, which would re-dirty everything). Restored-from-S3 content keeps
-          # its old mtimes; only genuinely changed files get copied -> only those
-          # recompile. Source is mirrored AFTER restore so the checkout wins on diff.
-          # .git IS mirrored (no --exclude): Run Script phases / SPM plugins that
-          # shell out to git for version stamping need it, and git objects are
-          # content-addressed so --checksum skips unchanged ones cheaply.
+          # rsync --checksum preserves mtimes of unchanged files (a fresh checkout
+          # restamps every mtime, which would re-dirty everything); only genuinely
+          # changed files copy -> only those recompile. Mirrored after restore so the
+          # checkout wins. .git included: SPM/Run Script version-stamping needs it.
           echo "Mirroring source -> $STABLE_SRC (stable path for warm incremental)"
           rsync -a --checksum --delete "$CODEBUILD_SRC_DIR/" "$STABLE_SRC/"
           mark mirrored
@@ -162,16 +141,10 @@ phases:
           xcrun simctl boot "$DEST_ID" || true
 
           # --- warm build state: DerivedData + resolved SPM, per repo ---
-          # Lives under $REPO_STATE (instance-local, restored from / saved to S3
-          # above + below). We do NOT use CodeBuild's `cache:` feature:
-          # LOCAL_CUSTOM_CACHE symlinks through a root-owned backing store the build
-          # user can't write (POSIX 13). We drive the S3 round-trip by hand instead,
-          # which also lets us key per repo and skip restore when already warm.
-          # xcodebuild reuses warm DerivedData -> only changed files recompile.
-          #
-          # CLEAN_BUILD=true (per-call ios_test arg) forces a cold build for THIS
-          # run by using a fresh ephemeral DerivedData, leaving the warm state
-          # intact for the next normal build.
+          # Under $REPO_STATE (restored from / saved to S3). No CodeBuild `cache:`:
+          # LOCAL_CUSTOM_CACHE symlinks through a root-owned store the build user
+          # can't write (POSIX 13). CLEAN_BUILD=true forces a cold build via fresh
+          # ephemeral DerivedData, leaving warm state intact.
           if [ "$CLEAN_BUILD" = "true" ]; then
             DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
             SPM_DIR="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/SourcePackages"
@@ -226,23 +199,12 @@ phases:
           fi
 
           # --- save warm state to S3, gated by TWO independent layers ------------
-          # The tar+gzip+upload costs ~160-200s, so only pay it when it buys
-          # something. Both layers must agree before we save (either can veto):
-          #
-          # Layer 1 (source-content hash): if SRC_HASH == the hash stored beside the
-          #   S3 tar, the checked-out source is byte-identical to what produced the
-          #   cached state -> nothing worth re-uploading. Generated files aren't in
-          #   the hash, so the per-run asset-catalog recompile floor never trips it.
-          # Layer 2 (per-repo compile floor, CACHE_SAVE_THRESHOLD): some repos
-          #   recompile a fixed N files every warm run (e.g. ~69 for TTM from the
-          #   asset catalog). If this run's recompiles fall below the repo-declared
-          #   threshold, it's just that floor -> skip even if Layer 1 disagreed.
-          #   COMPILES is counted as object/module artifacts newer than the sentinel
-          #   (the log isn't flushed yet inside run(), so we count files, not lines).
-          #
-          # Seeding always wins: if S3 has no cache yet we must upload once so a
-          # sibling Mac has something to restore, regardless of either layer.
-          # Skipped entirely for clean builds (throwaway DerivedData).
+          # tar+gzip+upload costs ~160-200s; only pay it when it buys something.
+          # Layer 1 (commit SHA): SRC_HASH == stored hash -> source identical -> skip.
+          # Layer 2 (CACHE_SAVE_THRESHOLD): if recompiles < repo's known churn floor,
+          #   it's just that floor -> skip even if Layer 1 disagreed. COMPILES counts
+          #   artifacts newer than the sentinel. Seeding always wins (empty S3 ->
+          #   upload once so siblings can restore). Skipped for clean builds.
           if [ "$CLEAN_BUILD" != "true" ]; then
             COMPILES=0
             for d in "$DERIVED/Build/Intermediates.noindex" "$DERIVED/Build/Products"; do
@@ -462,11 +424,8 @@ artifacts:
     - "screenshot_final.png"
   base-directory: "."
 
-# No CodeBuild `cache:` block on purpose. We manage warm state by hand in the
-# build phase: per-repo DerivedData + resolved SPM + stable src under
-# $HOME/ios-mcp-state, persisted on the reserved Mac AND round-tripped to S3
-# (warm-cache/<repo>.tar.gz) so a sibling Mac warms from it (reserved fleets have
-# no build-to-instance affinity). We avoid LOCAL_CUSTOM_CACHE because it symlinks
-# through a root-owned store the build user can't write (POSIX 13), and the
-# native S3 cache can't preserve the absolute-path-stable layout Swift
-# incremental needs. See the build phase for details.
+# No CodeBuild `cache:` block: warm state is managed by hand in the build phase
+# (per-repo+size DerivedData + SPM + stable src under $HOME/ios-mcp-state,
+# round-tripped to S3 warm-cache/<key>.tar.gz). LOCAL_CUSTOM_CACHE symlinks
+# through a root-owned store the build user can't write (POSIX 13); native S3
+# cache can't preserve the absolute-path-stable layout Swift incremental needs.
