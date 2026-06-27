@@ -14,6 +14,8 @@ env:
     OS_VERSION: "latest"
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
+    PLATFORM: "auto"    # auto|ios|macos — auto picks iOS Simulator if the scheme has
+                        # one, else native macOS (SwiftUI/AppKit Mac apps). ios_test override.
     CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build; warm state untouched
     RECORD_SESSION: ""  # "true" (per-call ios_test arg) records the whole simulator display to session.mp4
     COMPUTE_SIZE: "medium"  # fleet size this run lands on; scopes the S3 warm cache key so
@@ -44,29 +46,21 @@ phases:
           BRANCH="${BRANCH##refs/heads/}"
 
           # --- stable, per-repo warm state (instance-local + S3-backed) ----------
-          # 1) CodeBuild checks out to a NEW /tmp/codebuild-<uuid>/ each run; Swift
-          #    bakes the absolute working-dir into incremental state, so a moving src
-          #    = full recompile. Fix: mirror to a STABLE path ($HOME=/Users/cbuser,
-          #    identical fleet-wide) and build there.
-          # 2) Reserved fleets have no build-to-instance affinity; a repo is warm only
-          #    on the Mac it last ran on. Fix: back warm state with S3, restore on a
-          #    cold instance. Key is per-repo+size so apps/fleets don't contaminate.
+          # (1) CodeBuild checks out to a fresh /tmp dir each run; Swift bakes the
+          # abs working-dir into incremental state, so mirror to a STABLE path and
+          # build there. (2) Reserved fleets have no build-to-instance affinity, so
+          # back warm state with S3 and restore on a cold instance (key per-repo+size).
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
-          # SRC_KEY is scoped by repo + subdir + COMPUTE_SIZE. Size matters because
-          # medium and large are SEPARATE fleets: a large Mac restoring medium's tar
-          # (or vice versa) fails Swift's incremental validity check -> full recompile,
-          # then re-saves its own -> the two sizes endlessly clobber a shared key.
-          # Size in the key gives each fleet its own consistent cache; cross-instance
-          # warm then works reliably within a size (proven: medium->medium = 65 compiles).
+          # SRC_KEY scoped by repo + subdir + COMPUTE_SIZE (medium/large are separate
+          # fleets; a cross-size restore fails Swift's incremental check, so each size
+          # gets its own consistent cache key).
           SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_' )
           REPO_STATE="$WARM_ROOT/$SRC_KEY"
           STABLE_SRC="$REPO_STATE/src"
           S3_CACHE="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.tar.gz"
 
-          # Restore from S3 only when this instance is cold for this repo (no local
-          # DerivedData) and not a forced clean build. Streamed tar + gzip -1: no
-          # temp-disk doubling. S3_HAD_CACHE gates the save: seed once if S3 is empty
-          # even when warm-local, else a sibling Mac has nothing to restore.
+          # Restore from S3 only when cold for this repo (no local DerivedData) and
+          # not a forced clean build. S3_HAD_CACHE gates the save (seed once if empty).
           S3_HAD_CACHE=0
           aws s3 ls "$S3_CACHE" >/dev/null 2>&1 && S3_HAD_CACHE=1
           if [ "$CLEAN_BUILD" != "true" ] && [ ! -d "$REPO_STATE/DerivedData" ]; then
@@ -81,15 +75,11 @@ phases:
           fi
           mark restored
 
-          # Source identity (Layer 1 of the save gate). The build is a checkout at a
-          # known git commit, so the commit SHA fully identifies the source — far more
-          # stable than hashing the filesystem (which churns: SPM rewrites
-          # Package.resolved, generated files land in the tree, mtimes shift), which is
-          # why an earlier file-glob hash drifted between two identical-source runs and
-          # the skip never fired. Prefer CodeBuild's resolved commit; fall back to the
-          # git HEAD of the mirrored .git, then to a sorted source shasum for non-git
-          # sources. At save time we compare to the value stored beside the S3 tar:
-          # same SHA => source unchanged => skip the ~160-200s re-upload.
+          # Source identity (Layer 1 of the save gate): the commit SHA fully
+          # identifies the checkout (stabler than a filesystem hash, which churns as
+          # SPM rewrites Package.resolved). Prefer CodeBuild's resolved commit, then
+          # the mirrored .git HEAD, then a sorted source shasum. Compared at save time
+          # to the value stored beside the S3 tar: same SHA => skip the re-upload.
           S3_HASH="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.hash"
           SRC_HASH="${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"
           if [ -z "$SRC_HASH" ]; then
@@ -131,14 +121,62 @@ phases:
           if [ -z "$SCHEME" ]; then echo "ERROR: no scheme given and none auto-detected (shared schemes: $(python3 -c "import json;print(json.load(open('schemes.json'))['schemes'])" 2>/dev/null))"; return 1; fi
           echo "Using scheme: $SCHEME"
 
-          # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
-          DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-          if [ -z "$DEST_ID" ]; then
-            echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
-            DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          # --- pick the test platform: iOS simulator vs native macOS ------------
+          # macOS apps have NO simulator (only "platform:macOS"); a sim destination
+          # then fails "no destination matching". Probe the scheme: iOS Simulator =>
+          # run there (default, unchanged), else native macOS.
+          # PLATFORM=auto|ios|macos overrides (env, set by ios_test); default auto.
+          DESTS=$(xcodebuild "${CONTAINER[@]}" -scheme "$SCHEME" -showdestinations 2>/dev/null || echo "")
+          HAS_IOS_SIM=0; HAS_MACOS=0
+          echo "$DESTS" | grep -q 'platform:iOS Simulator' && HAS_IOS_SIM=1
+          echo "$DESTS" | grep -q 'platform:macOS' && HAS_MACOS=1
+          case "${PLATFORM:-auto}" in
+            ios)   USE_MACOS=0 ;;
+            macos) USE_MACOS=1 ;;
+            *)     if [ "$HAS_IOS_SIM" = "1" ]; then USE_MACOS=0; else USE_MACOS=1; fi ;;
+          esac
+
+          DEST_ID=""          # set only on the simulator path (guards simctl below)
+          DEST_ARG=()
+          SIGN_ARGS=()        # macOS-only: skip codesign (CI Mac has no dev cert/key)
+          LAUNCHER=()         # macOS-only: run inside the console GUI session
+          if [ "$USE_MACOS" = "1" ]; then
+            [ "$HAS_MACOS" = "1" ] || { echo "ERROR: scheme '$SCHEME' has no macOS destination"; echo "$DESTS"; return 1; }
+            echo "Platform: macOS (native; no simulator)"
+            DEST_ARG=(-destination 'platform=macOS')
+            # CI Mac has no signing identity; disable signing for the test build
+            # (standard headless CI; sim never signs, so macOS-only).
+            SIGN_ARGS=(CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO)
+            # XCUITest needs testmanagerd, which lives in the GUI (Aqua) session of
+            # the logged-in console user. CodeBuild runs as a daemon with no such
+            # session -> "testmanagerd ... No such process". Re-exec xcodebuild via
+            # launchctl asuser <console-uid> so it joins that session. Skip if the
+            # build user already IS the console user (no-op then).
+            # NOTE: macOS XCUITest (unlike iOS-sim UI tests) needs a logged-in GUI
+            # session — testmanagerd lives in the console user's Aqua session. The
+            # stock CodeBuild image boots to the login window with NO user session,
+            # so UI tests need a CUSTOM auto-login AMI; only unit tests run otherwise.
+            # If a console user IS logged in (custom AMI), route into that session:
+            CONSOLE_UID=$(stat -f%u /dev/console 2>/dev/null || echo "0")
+            if [ "$CONSOLE_UID" != "0" ] && [ "$CONSOLE_UID" != "$(id -u)" ]; then
+              echo "Console user logged in (uid $CONSOLE_UID) -> running tests in that GUI session"
+              LAUNCHER=(sudo launchctl asuser "$CONSOLE_UID")
+            else
+              echo "WARNING: no logged-in GUI session (uid=$CONSOLE_UID). macOS UI tests will fail"
+              echo "         with 'testmanagerd ... No such process'; use a custom auto-login AMI."
+            fi
+          else
+            # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
+            DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+            if [ -z "$DEST_ID" ]; then
+              echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
+              DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+            fi
+            [ -z "$DEST_ID" ] && { echo "ERROR: no iPhone simulator available"; return 1; }
+            echo "Platform: iOS Simulator ($DEST_ID)"
+            xcrun simctl boot "$DEST_ID" || true
+            DEST_ARG=(-destination "id=$DEST_ID")
           fi
-          [ -z "$DEST_ID" ] && { echo "ERROR: no iPhone simulator available"; return 1; }
-          xcrun simctl boot "$DEST_ID" || true
 
           # --- warm build state: DerivedData + resolved SPM, per repo ---
           # Under $REPO_STATE (restored from / saved to S3). No CodeBuild `cache:`:
@@ -157,35 +195,35 @@ phases:
           mkdir -p "$DERIVED" "$SPM_DIR"
           DERIVED_ARGS=(-derivedDataPath "$DERIVED" -clonedSourcePackagesDirPath "$SPM_DIR")
 
-          # No explicit -resolvePackageDependencies pass: `xcodebuild test` resolves
-          # the package graph itself, so a separate pre-resolve just doubled the
-          # ~100s graph computation. The warm SPM checkouts dir is reused either way.
+          # No pre-resolve pass: `xcodebuild test` resolves the graph itself.
           TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
 
           # --- optional whole-session video (RECORD_SESSION=true) ---
           # OS-level capture of the simulator display, independent of whatever the
           # XCUITest captures into the xcresult. Recorder runs in the background;
           # SIGINT (not KILL) lets simctl finalize a playable mp4.
+          # simctl io records the SIMULATOR only; skip on the native-macOS path.
           REC_PID=""
-          if [ "$RECORD_SESSION" = "true" ]; then
+          if [ "$RECORD_SESSION" = "true" ] && [ -n "$DEST_ID" ]; then
             echo "Recording session -> session.mp4"
             xcrun simctl io "$DEST_ID" recordVideo --codec h264 --force "$CODEBUILD_SRC_DIR/session.mp4" &
             REC_PID=$!
+          elif [ "$RECORD_SESSION" = "true" ]; then
+            echo "RECORD_SESSION ignored on macOS (no simulator display to capture)"
           fi
 
-          # Sentinel for the post-build compile count (Layer 2 of the save gate +
-          # the compiles_artifacts metric). Touched immediately before xcodebuild,
-          # so any .o/.swiftmodule newer than it was produced by THIS run. Must be a
-          # real file: `find -newer ""` errors and silently yields 0.
+          # Sentinel for the post-build compile count (touched just before xcodebuild
+          # so newer .o/.swiftmodule = this run's recompiles).
           BUILD_SENTINEL="$REPO_STATE/.build_sentinel"
           mkdir -p "$REPO_STATE"; : > "$BUILD_SENTINEL"
 
           echo "=== xcodebuild test ==="
           mark test_start
-          xcodebuild test \
+          "${LAUNCHER[@]}" xcodebuild test \
             "${CONTAINER[@]}" \
             -scheme "$SCHEME" \
-            -destination "id=$DEST_ID" \
+            "${DEST_ARG[@]}" \
+            "${SIGN_ARGS[@]}" \
             -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
             "${TESTPLAN_ARG[@]}" \
             "${DERIVED_ARGS[@]}" \
@@ -198,13 +236,10 @@ phases:
             wait "$REC_PID" 2>/dev/null || true
           fi
 
-          # --- save warm state to S3, gated by TWO independent layers ------------
-          # tar+gzip+upload costs ~160-200s; only pay it when it buys something.
-          # Layer 1 (commit SHA): SRC_HASH == stored hash -> source identical -> skip.
-          # Layer 2 (CACHE_SAVE_THRESHOLD): if recompiles < repo's known churn floor,
-          #   it's just that floor -> skip even if Layer 1 disagreed. COMPILES counts
-          #   artifacts newer than the sentinel. Seeding always wins (empty S3 ->
-          #   upload once so siblings can restore). Skipped for clean builds.
+          # --- save warm state to S3, gated by TWO layers (tar+upload ~160-200s) --
+          # L1 (commit SHA): SRC_HASH == stored -> source identical -> skip.
+          # L2 (CACHE_SAVE_THRESHOLD): recompiles < repo churn floor -> skip.
+          # Seeding always wins (empty S3 -> upload once). Skipped for clean builds.
           if [ "$CLEAN_BUILD" != "true" ]; then
             COMPILES=0
             for d in "$DERIVED/Build/Intermediates.noindex" "$DERIVED/Build/Products"; do
@@ -350,11 +385,8 @@ phases:
         aws s3 cp "$CODEBUILD_SRC_DIR/summary.json" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/summary.json" || true
         echo "=== summary.json ==="; cat "$CODEBUILD_SRC_DIR/summary.json" || true
 
-        # --- self-reported build metrics: one greppable line + metrics.json in S3
-        # so collect-metrics.py can harvest every run without re-parsing the log.
-        # Phase secs come from phase_times.txt; compile/stale counts + cache state
-        # from the log; test counts from summary.json. All best-effort. SRC_KEY is
-        # recomputed here (it was a run() local) identically to the run() version.
+        # --- self-reported build metrics: metrics.json in S3 (best-effort). SRC_KEY
+        # recomputed here identically to the run() local.
         METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_')
         python3 - "$LOG" "$PHASES" "$CODEBUILD_SRC_DIR/summary.json" \
                  "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" \
