@@ -27,11 +27,9 @@ phases:
   build:
     commands:
       - |
-        # No global `set -e`: scheme/device probing (ls, grep) returns nonzero on
-        # "no match" and would abort before xcodebuild; we capture the test exit
-        # code explicitly. ALL output is tee'd to build_output.log, which + an
-        # error_tail.txt ALWAYS upload to builds/<id>/ even on pre-test failure --
-        # the contract get_build_log reads.
+        # No global `set -e`: scheme/device probing returns nonzero on "no match"
+        # and would abort before xcodebuild; we capture the test exit explicitly.
+        # All output tees to build_output.log + error_tail.txt, always uploaded.
         LOG="$CODEBUILD_SRC_DIR/build_output.log"
 
         # run() is piped to tee; recover its exit via PIPESTATUS, use `return` not
@@ -45,11 +43,9 @@ phases:
           BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
           BRANCH="${BRANCH##refs/heads/}"
 
-          # --- stable, per-repo warm state (instance-local + S3-backed) ----------
-          # (1) CodeBuild checks out to a fresh /tmp dir each run; Swift bakes the
-          # abs working-dir into incremental state, so mirror to a STABLE path and
-          # build there. (2) Reserved fleets have no build-to-instance affinity, so
-          # back warm state with S3 and restore on a cold instance (key per-repo+size).
+          # Stable per-repo warm state (instance-local + S3-backed). Mirror the
+          # fresh /tmp checkout to a STABLE path (Swift bakes abs cwd into incremental
+          # state); back it with S3 since reserved fleets have no build-instance affinity.
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
 
           # --- disk guard: warm state grows unbounded on the reserved (persistent-
@@ -77,9 +73,8 @@ phases:
             fi
           fi
 
-          # SRC_KEY scoped by repo + subdir + COMPUTE_SIZE (medium/large are separate
-          # fleets; a cross-size restore fails Swift's incremental check, so each size
-          # gets its own consistent cache key).
+          # SRC_KEY = repo+subdir+size (medium/large are separate fleets; cross-size
+          # restore fails Swift's incremental check, so each size keys its own cache).
           SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_' )
           REPO_STATE="$WARM_ROOT/$SRC_KEY"
           STABLE_SRC="$REPO_STATE/src"
@@ -101,11 +96,7 @@ phases:
           fi
           mark restored
 
-          # Source identity (Layer 1 of the save gate): the commit SHA fully
-          # identifies the checkout (stabler than a filesystem hash, which churns as
-          # SPM rewrites Package.resolved). Prefer CodeBuild's resolved commit, then
-          # the mirrored .git HEAD, then a sorted source shasum. Compared at save time
-          # to the value stored beside the S3 tar: same SHA => skip the re-upload.
+          # Save-gate L1: commit SHA (resolved > HEAD > shasum); same SHA at save => skip upload.
           S3_HASH="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.hash"
           SRC_HASH="${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"
           if [ -z "$SRC_HASH" ]; then
@@ -122,13 +113,46 @@ phases:
           STORED_HASH=$(aws s3 cp "$S3_HASH" - 2>/dev/null || echo "")
 
           mkdir -p "$STABLE_SRC"
-          # rsync --checksum preserves mtimes of unchanged files (a fresh checkout
-          # restamps every mtime, which would re-dirty everything); only genuinely
-          # changed files copy -> only those recompile. Mirrored after restore so the
-          # checkout wins. .git included: SPM/Run Script version-stamping needs it.
+          # rsync --checksum: only genuinely changed files copy (preserves mtimes,
+          # so only those recompile). After restore so the checkout wins; .git kept.
           echo "Mirroring source -> $STABLE_SRC (stable path for warm incremental)"
           rsync -a --checksum --delete "$CODEBUILD_SRC_DIR/" "$STABLE_SRC/"
           mark mirrored
+
+          # Hydrate gitignored secret files BEFORE xcodebuild; nothing secret in git.
+          # .codebuild/secrets.json: [{"path","source"}], source secretsmanager:<id>
+          # or ssm:<name>. ci/prebuild.sh: repo escape hatch (CWD=repo root).
+          # HYDRATED_PATHS are excluded from the S3 warm-cache tar (re-fetched each run).
+          HYDRATED_PATHS=()
+          SECRETS_MANIFEST="$STABLE_SRC/.codebuild/secrets.json"
+          if [ -f "$SECRETS_MANIFEST" ]; then
+            echo "Hydrating secrets from .codebuild/secrets.json"
+            # path<TAB>source to a temp file, read WITHOUT a subshell (CodeBuild's
+            # POSIX shell has no `<(...)`) so HYDRATED_PATHS survives the loop.
+            MANIFEST_TSV="$REPO_STATE/.secrets.tsv"
+            python3 -c "import json;[print(e['path']+chr(9)+e['source']) for e in json.load(open('$SECRETS_MANIFEST'))]" > "$MANIFEST_TSV"
+            while IFS="$(printf '\t')" read -r REL SRC; do
+              [ -z "$REL" ] && continue
+              DEST="$STABLE_SRC/$REL"; mkdir -p "$(dirname "$DEST")"
+              case "$SRC" in
+                secretsmanager:*)
+                  if aws secretsmanager get-secret-value --secret-id "${SRC#secretsmanager:}" --query SecretString --output text > "$DEST" 2>/dev/null; then
+                    echo "  $REL <- secretsmanager ${SRC#secretsmanager:}"; HYDRATED_PATHS+=("$REL")
+                  else echo "ERROR: fetch secret '${SRC#secretsmanager:}' for $REL"; return 1; fi ;;
+                ssm:*)
+                  if aws ssm get-parameter --name "${SRC#ssm:}" --with-decryption --query Parameter.Value --output text > "$DEST" 2>/dev/null; then
+                    echo "  $REL <- ssm ${SRC#ssm:}"; HYDRATED_PATHS+=("$REL")
+                  else echo "ERROR: fetch ssm '${SRC#ssm:}' for $REL"; return 1; fi ;;
+                *) echo "ERROR: bad secret source '$SRC' for $REL (secretsmanager:/ssm:)"; return 1 ;;
+              esac
+            done < "$MANIFEST_TSV"
+            rm -f "$MANIFEST_TSV"
+          fi
+          if [ -f "$STABLE_SRC/ci/prebuild.sh" ]; then
+            echo "Running ci/prebuild.sh"
+            ( cd "$STABLE_SRC" && bash ci/prebuild.sh ) || { echo "ERROR: ci/prebuild.sh failed"; return 1; }
+          fi
+
           cd "$STABLE_SRC/$PROJECT_DIR" || { echo "ERROR: PROJECT_DIR '$PROJECT_DIR' not found under $STABLE_SRC"; return 1; }
 
           # --- pick container: workspace beats project (globs may not match) ---
@@ -170,19 +194,12 @@ phases:
             [ "$HAS_MACOS" = "1" ] || { echo "ERROR: scheme '$SCHEME' has no macOS destination"; echo "$DESTS"; return 1; }
             echo "Platform: macOS (native; no simulator)"
             DEST_ARG=(-destination 'platform=macOS')
-            # CI Mac has no signing identity; disable signing for the test build
-            # (standard headless CI; sim never signs, so macOS-only).
+            # CI Mac has no signing identity; disable signing (macOS-only; sim never signs).
             SIGN_ARGS=(CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO)
-            # XCUITest needs testmanagerd, which lives in the GUI (Aqua) session of
-            # the logged-in console user. CodeBuild runs as a daemon with no such
-            # session -> "testmanagerd ... No such process". Re-exec xcodebuild via
-            # launchctl asuser <console-uid> so it joins that session. Skip if the
-            # build user already IS the console user (no-op then).
-            # NOTE: macOS XCUITest (unlike iOS-sim UI tests) needs a logged-in GUI
-            # session — testmanagerd lives in the console user's Aqua session. The
-            # stock CodeBuild image boots to the login window with NO user session,
-            # so UI tests need a CUSTOM auto-login AMI; only unit tests run otherwise.
-            # If a console user IS logged in (custom AMI), route into that session:
+            # macOS XCUITest needs testmanagerd in the console user's GUI (Aqua) session;
+            # CodeBuild runs as a daemon with none -> "testmanagerd ... No such process".
+            # Re-exec via launchctl asuser <uid> to join it. Stock image has no session
+            # (only unit tests run); a custom auto-login AMI provides one. Route in if present:
             CONSOLE_UID=$(stat -f%u /dev/console 2>/dev/null || echo "0")
             if [ "$CONSOLE_UID" != "0" ] && [ "$CONSOLE_UID" != "$(id -u)" ]; then
               echo "Console user logged in (uid $CONSOLE_UID) -> running tests in that GUI session"
@@ -204,11 +221,8 @@ phases:
             DEST_ARG=(-destination "id=$DEST_ID")
           fi
 
-          # --- warm build state: DerivedData + resolved SPM, per repo ---
-          # Under $REPO_STATE (restored from / saved to S3). No CodeBuild `cache:`:
-          # LOCAL_CUSTOM_CACHE symlinks through a root-owned store the build user
-          # can't write (POSIX 13). CLEAN_BUILD=true forces a cold build via fresh
-          # ephemeral DerivedData, leaving warm state intact.
+          # Warm build state (DerivedData + SPM) under $REPO_STATE (S3-backed).
+          # CLEAN_BUILD=true uses fresh ephemeral DerivedData, leaving warm state intact.
           if [ "$CLEAN_BUILD" = "true" ]; then
             DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
             SPM_DIR="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/SourcePackages"
@@ -224,14 +238,15 @@ phases:
           # No pre-resolve pass: `xcodebuild test` resolves the graph itself.
           TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
 
-          # --- optional whole-session video (RECORD_SESSION=true) ---
-          # OS-level capture of the simulator display, independent of whatever the
-          # XCUITest captures into the xcresult. Recorder runs in the background;
-          # SIGINT (not KILL) lets simctl finalize a playable mp4.
-          # simctl io records the SIMULATOR only; skip on the native-macOS path.
+          # Optional whole-session video (RECORD_SESSION=true). simctl io records the
+          # SIMULATOR only (skip on macOS); SIGINT lets it finalize a playable mp4.
+          # Recording pins tests to the recorded device (-parallel-testing-enabled NO):
+          # with parallel testing on, xcodebuild runs UI tests on a CLONE ("Clone 1 of
+          # iPhone X") while the recorder watches the idle base sim -> Home-screen video.
           REC_PID=""
           if [ "$RECORD_SESSION" = "true" ] && [ -n "$DEST_ID" ]; then
-            echo "Recording session -> session.mp4"
+            echo "Recording session -> session.mp4 (parallel testing disabled so tests run on the recorded sim)"
+            DERIVED_ARGS+=(-parallel-testing-enabled NO)
             xcrun simctl io "$DEST_ID" recordVideo --codec h264 --force "$CODEBUILD_SRC_DIR/session.mp4" &
             REC_PID=$!
           elif [ "$RECORD_SESSION" = "true" ]; then
@@ -292,7 +307,10 @@ phases:
             if [ "$SAVE" = "1" ]; then
               echo "Saving warm cache -> $S3_CACHE ($REASON; $COMPILES recompiled)"
               T0=$(date +%s)
-              if tar -c -C "$WARM_ROOT" "$SRC_KEY" 2>/dev/null | gzip -1 2>/dev/null | aws s3 cp - "$S3_CACHE" 2>/dev/null; then
+              # Exclude hydrated secrets from the cache tar (re-fetched each restore).
+              TAR_EXCLUDES=()
+              for rel in "${HYDRATED_PATHS[@]}"; do TAR_EXCLUDES+=(--exclude="$SRC_KEY/src/$rel"); done
+              if tar -c "${TAR_EXCLUDES[@]}" -C "$WARM_ROOT" "$SRC_KEY" 2>/dev/null | gzip -1 2>/dev/null | aws s3 cp - "$S3_CACHE" 2>/dev/null; then
                 printf '%s' "$SRC_HASH" | aws s3 cp - "$S3_HASH" 2>/dev/null || true
                 CACHE_SAVED=true
                 echo "Warm cache saved in $(( $(date +%s) - T0 ))s"
@@ -315,9 +333,8 @@ phases:
         run 2>&1 | tee "$LOG"
         TEST_RC=${PIPESTATUS[0]}
 
-        # --- diagnostics: ALWAYS upload the raw log + a focused error tail, so a
-        #     build that fails before tests still surfaces its real error via the
-        #     get_build_log tool / ios_build_status build_errors. ---
+        # Diagnostics: always upload raw log + focused error tail so a pre-test
+        # failure still surfaces via get_build_log / ios_build_status build_errors.
         {
           echo "=== error / failure lines ===";
           grep -nE 'error:|fatal error|\*\* (BUILD|TEST|CLEAN) FAILED|xcodebuild: error|Code=|No such|not found|Unable to|Could not|Testing cancelled|Linker command failed' "$LOG" | tail -120;
@@ -335,20 +352,12 @@ phases:
           aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
         fi
 
-        # --- visual assets: extract whatever the test captured + bundle a
-        #     single downloadable assets.zip (images + session video) ---
-        # The agent can't run xcresulttool/ffmpeg (Linux Lambda), so the Mac does
-        # all extraction here and ships ready-to-view files. assets/ holds:
-        #   - every XCTAttachment image baked into the xcresult (per-test captures)
-        #   - screenshot_final.png (the post-run frame)
-        #   - session.mp4 (only if RECORD_SESSION=true)
-        # Images are ALSO copied to builds/<id>/screenshots/ so the existing
-        # ios_build_status / get_test_logs presigned URLs keep serving them.
+        # Visual assets: extract test attachments + bundle assets.zip (Mac does it;
+        # Lambda can't run xcresulttool). Images also copied to builds/<id>/screenshots/
+        # so existing presigned-URL tools keep serving them.
         ASSETS="$CODEBUILD_SRC_DIR/assets"; mkdir -p "$ASSETS"
         if [ -d TestResults.xcresult ]; then
-          # xcresulttool export attachments dumps every attachment + a manifest;
-          # filenames there are opaque, so rename images by their declared
-          # suggestedHumanReadableName from the manifest for readable evidence.
+          # Rename images by suggestedHumanReadableName (exported filenames are opaque).
           xcrun xcresulttool export attachments \
             --path TestResults.xcresult \
             --output-path "$ASSETS/_raw" 2>/dev/null || true
@@ -429,14 +438,12 @@ phases:
             return (t[b] - t[a]) if a in t and b in t else None
         text = open(log, errors="replace").read()
         compiles = len(re.findall(r'SwiftCompile |CompileSwiftSources', text))
-        # stale = incremental "will remove" / outdated-output purges
         stale = len(re.findall(r'\bremoved? outdated\b|will remove', text, re.I))
         restored = "Warm cache restored" in text
-        # cache state heuristic from compile volume (cold ~thousands, warm <~150)
+        # cache state from compile volume (cold ~thousands, warm <~150)
         state = "cold" if compiles > 800 else ("warm" if compiles < 150 else "partial")
         try: summ = json.load(open(summ_f))
         except Exception: summ = {}
-        # Save-gate decision (written by the build phase): hash, saved?, reason.
         cache = {}
         try:
             for ln in open(cache_f):
