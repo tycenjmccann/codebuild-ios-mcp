@@ -51,6 +51,32 @@ phases:
           # build there. (2) Reserved fleets have no build-to-instance affinity, so
           # back warm state with S3 and restore on a cold instance (key per-repo+size).
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
+
+          # --- disk guard: warm state grows unbounded on the reserved (persistent-
+          # disk) fleet — every repo+subdir+size adds a full DerivedData/SPM/src tree
+          # and nothing prunes it, so the instance eventually fills and DOWNLOAD_SOURCE
+          # fails before this buildspec even runs. Before doing anything expensive,
+          # evict least-recently-used per-repo state dirs until the root FS is back
+          # under DISK_HIGH_PCT. S3 is the source of truth (each repo re-restores on
+          # its next build), so eviction only ever costs a one-time cold compile.
+          DISK_HIGH_PCT="${DISK_HIGH_PCT:-85}"   # start evicting above this %used
+          DISK_LOW_PCT="${DISK_LOW_PCT:-70}"     # stop once back under this %used
+          disk_pct() { df -P / | awk 'NR==2{gsub("%","",$5); print $5}'; }
+          if [ -d "$WARM_ROOT" ]; then
+            USED=$(disk_pct)
+            if [ "${USED:-0}" -ge "$DISK_HIGH_PCT" ]; then
+              echo "Disk ${USED}% >= ${DISK_HIGH_PCT}% -> evicting LRU warm-state dirs (S3-backed, safe)"
+              # oldest-mtime first; skip the dir we're about to use this run.
+              ls -dt "$WARM_ROOT"/*/ 2>/dev/null | tail -r 2>/dev/null | while read -r d; do
+                [ -d "$d" ] || continue
+                U=$(disk_pct); [ "${U:-0}" -lt "$DISK_LOW_PCT" ] && break
+                echo "  evict $(basename "$d") ($(du -sh "$d" 2>/dev/null | cut -f1))"
+                rm -rf "$d"
+              done
+              echo "Disk after eviction: $(disk_pct)%"
+            fi
+          fi
+
           # SRC_KEY scoped by repo + subdir + COMPUTE_SIZE (medium/large are separate
           # fleets; a cross-size restore fails Swift's incremental check, so each size
           # gets its own consistent cache key).
