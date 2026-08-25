@@ -7,8 +7,9 @@
       "properties": {
         "branch": { "type": "string", "description": "Git branch or commit SHA to test" },
         "scheme": { "type": "string", "description": "Xcode scheme to build and test" },
-        "device": { "type": "string", "description": "Simulator device name (e.g. 'iPhone 17')" },
+        "device": { "type": "string", "description": "Simulator device name (e.g. 'iPhone 17'). Ignored on the macOS platform." },
         "os_version": { "type": "string", "description": "iOS version (e.g. '18.2' or 'latest')" },
+        "platform": { "type": "string", "enum": ["auto", "ios", "macos"], "description": "Test platform. 'auto' (default) runs on the iOS Simulator when the scheme exposes one, else native macOS — so SwiftUI/AppKit Mac-app schemes (no simulator destination) just work. Force 'ios' or 'macos' to override. On macOS there is no simulator: 'device'/'record_session' are ignored and the app runs as 'platform=macOS'." },
         "test_plan": { "type": "string", "description": "Optional test plan name (empty = default)" },
         "repo": { "type": "string", "description": "GitHub repo URL to build, e.g. https://github.com/owner/name.git (multi-app: point the shared project at this repo for this run). Optional, but the default is a FIXED deploy-time repo that does NOT adapt to your project — if you are testing any repo other than that one, you must pass this, or the checkout fails on a branch that doesn't exist there. The resolved repo is echoed in the ios_test response and in any BUILD_ERROR." },
         "project_dir": { "type": "string", "description": "Subdir (relative to repo root) holding the .xcworkspace/.xcodeproj, e.g. 'ios'. Optional; defaults to the deploy-time PROJECT_DIR (the repo root '.' unless configured otherwise) and does NOT adapt to your repo. Pass '.' when the workspace is at the repo root, or the matching subdir otherwise; a wrong value fails the build with \"PROJECT_DIR '<x>' not found\". The resolved value is echoed in the ios_test response." },

@@ -58,6 +58,10 @@ def ios_test(args: dict) -> dict:
     # .xcworkspace/.xcodeproj may live in a different subdir).
     if args.get("project_dir"):
         env.append({"name": "PROJECT_DIR", "value": args["project_dir"], "type": "PLAINTEXT"})
+    # Test platform: auto (default) picks iOS Simulator when the scheme has one,
+    # else native macOS (SwiftUI/AppKit Mac apps). Force with "ios" or "macos".
+    if args.get("platform"):
+        env.append({"name": "PLATFORM", "value": args["platform"], "type": "PLAINTEXT"})
     # Per-repo warm-cache save floor: skip the S3 re-upload when this run recompiled
     # fewer than N files (just the repo's fixed asset-catalog churn floor, not a real
     # source change). Layer 2 of the save gate; Layer 1 (source hash) runs always.
