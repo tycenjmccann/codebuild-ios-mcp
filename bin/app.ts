@@ -12,6 +12,8 @@ const app = new cdk.App();
  *   codebuild-ios-mcp:defaultDevice         Default simulator device name
  *   codebuild-ios-mcp:artifactRetentionDays Days before builds/ artifacts expire
  *   codebuild-ios-mcp:presignTtlSec         TTL for presigned artifact URLs
+ *   codebuild-ios-mcp:queuedTimeoutMinutes  Max QUEUED wait before CodeBuild fails a build
+ *   codebuild-ios-mcp:fleetStallMinutes     QUEUED-with-nothing-running = stalled fleet
  *
  * Account/region resolve from the standard CDK environment variables populated by
  * the AWS profile in use (CDK_DEFAULT_ACCOUNT / CDK_DEFAULT_REGION). No hardcoding.
@@ -43,6 +45,13 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   // ios_test(compute_size:"large"). Scale slots with -c ...:largeBaseCapacity=N.
   enableLarge: bool(ctx<unknown>('enableLarge', true), true),
   largeBaseCapacity: Math.max(1, Number(ctx<number>('largeBaseCapacity', 1))),
+  // Cap how long a build may sit QUEUED. CodeBuild's default is 8h, which turns a
+  // dead fleet into a build that silently never starts; 60 min is ~4 real builds
+  // deep on one reserved Mac. Clamped to CodeBuild's allowed 5-480 min.
+  queuedTimeoutMinutes: Math.min(480, Math.max(5, Number(ctx<number>('queuedTimeoutMinutes', 60)))),
+  // QUEUED this long with nothing running on the same fleet => ios_test refuses to
+  // enqueue (INSUFFICIENT_CAPACITY; force:true overrides).
+  fleetStallMinutes: Math.max(1, Number(ctx<number>('fleetStallMinutes', 20))),
   artifactRetentionDays: Number(ctx<number>('artifactRetentionDays', 14)),
   presignTtlSec: Number(ctx<number>('presignTtlSec', 3600)),
   // Optional VPC wiring — populate to reach private resources (Nexus, internal

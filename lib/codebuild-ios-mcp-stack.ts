@@ -38,6 +38,23 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly enableLarge: boolean;
   /** Concurrent build slots on the LARGE fleet (ignored when enableLarge=false). */
   readonly largeBaseCapacity: number;
+  /**
+   * How long a build may sit QUEUED before CodeBuild kills it. CodeBuild's default
+   * is 8 hours, which hides a dead fleet from the agent entirely — the build just
+   * never starts. One reserved Mac serializes builds at ~10-15 min each, so 60 min
+   * is roughly a four-deep real queue; longer than that means no instance is
+   * picking work up. The Lambda's stall preflight catches the genuinely-wedged
+   * fleet far sooner (FLEET_STALL_MINUTES); this is the backstop. Clamped to
+   * CodeBuild's allowed 5-480 min.
+   */
+  readonly queuedTimeoutMinutes: number;
+  /**
+   * How long a build may be QUEUED with NOTHING running on the same fleet before
+   * ios_test treats that fleet as stalled and refuses to enqueue
+   * (INSUFFICIENT_CAPACITY, overridable with force:true). Passed to the Lambda as
+   * FLEET_STALL_MINUTES.
+   */
+  readonly fleetStallMinutes: number;
   /** Days before objects under builds/ expire in the artifacts bucket. */
   readonly artifactRetentionDays: number;
   /** TTL (seconds) for presigned artifact URLs returned by the Lambda. */
@@ -340,6 +357,11 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       buildSpec: codebuild.BuildSpec.fromObjectToYaml(buildspecObject),
       role: codeBuildRole,
       timeout: cdk.Duration.minutes(40),
+      // Cap the QUEUED wait. Without this, CodeBuild's 8h default means a build no
+      // fleet instance can pick up (wedged/disk-full Mac) simply never starts, and
+      // the agent polls IN_PROGRESS forever. Failing it turns that into a
+      // BUILD_ERROR the Lambda labels as a queue timeout. See TEAM-4921.
+      queuedTimeout: cdk.Duration.minutes(props.queuedTimeoutMinutes),
       environment: {
         // The L2 rejects a Mac image at construct time ("Mac images must be used
         // with a fleet") because it can't see the fleet we attach below via
@@ -390,6 +412,9 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         // MEDIUM is the project default; LARGE empty when the large fleet is off.
         FLEET_MEDIUM_ARN: fleet.attrArn,
         FLEET_LARGE_ARN: fleetLarge ? fleetLarge.attrArn : '',
+        // Stall threshold for the ios_test capacity preflight: QUEUED longer than
+        // this with nothing running on the same fleet = wedged instance, not a queue.
+        FLEET_STALL_MINUTES: String(props.fleetStallMinutes),
         // AWS_REGION is reserved/auto-populated by the Lambda runtime.
       },
     });
@@ -409,6 +434,17 @@ export class CodebuildIosMcpStack extends cdk.Stack {
           'codebuild:ListBuildsForProject',
         ],
         resources: [project.projectArn],
+      }),
+    );
+    // Fleet health for the ios_test capacity preflight (refuse to enqueue onto a
+    // non-ACTIVE fleet). Scoped to this stack's fleet ARNs — no `*`. If the action
+    // turns out to be *-only in IAM, this grant fails closed and the preflight's
+    // best-effort path logs and proceeds on the stall check alone.
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadFleetStatus',
+        actions: ['codebuild:BatchGetFleets'],
+        resources: fleetLarge ? [fleet.attrArn, fleetLarge.attrArn] : [fleet.attrArn],
       }),
     );
     // Live log tail (get_build_log while IN_PROGRESS) reads the project's
