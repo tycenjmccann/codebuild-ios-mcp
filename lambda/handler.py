@@ -13,6 +13,8 @@ the macOS build takes.
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 
 import boto3
 
@@ -26,6 +28,11 @@ PRESIGN_TTL = int(os.environ.get("PRESIGN_TTL_SEC", "3600"))
 # large fleet is not enabled in the stack.
 FLEET_MEDIUM_ARN = os.environ.get("FLEET_MEDIUM_ARN", "")
 FLEET_LARGE_ARN = os.environ.get("FLEET_LARGE_ARN", "")
+# A build queued longer than this with NOTHING running on the same fleet means the
+# instance is wedged (unhealthy / out of disk), not that the queue is deep: one
+# reserved Mac finishes a build in ~10-15 min, so nothing should wait 20 min behind
+# an idle fleet. Used by the ios_test preflight and the ios_list_builds fleet view.
+FLEET_STALL_MINUTES = int(os.environ.get("FLEET_STALL_MINUTES", "20"))
 
 codebuild = boto3.client("codebuild", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
@@ -38,6 +45,19 @@ logs = boto3.client("logs", region_name=REGION)
 def ios_test(args: dict) -> dict:
     branch = args["branch"]
     scheme = args["scheme"]
+    # CodeBuild's DOWNLOAD_SOURCE can fetch a branch/tag or a FULL 40-hex commit
+    # SHA; an abbreviated SHA dies with the opaque "git fetch failed with exit
+    # status 128" after burning a build slot (TEAM-4921). Reject it here, for free.
+    # This also rejects an all-hex branch name (e.g. `deadbeef`) — rare, and the
+    # fix for that is an explicit ref, not a looser pattern.
+    if re.fullmatch(r"[0-9a-fA-F]{7,39}", branch or ""):
+        return {
+            "status": "ERROR",
+            "reason": "SHORT_SHA",
+            "message": f"'{branch}' looks like an abbreviated commit SHA. CodeBuild can "
+                       "only check out a branch/tag name or a FULL 40-hex SHA — pass the "
+                       "branch name, or the complete SHA (git rev-parse <short>).",
+        }
     env = [
         {"name": "SCHEME", "value": scheme, "type": "PLAINTEXT"},
         {"name": "DEVICE", "value": args.get("device", "iPhone 17"), "type": "PLAINTEXT"},
@@ -89,6 +109,7 @@ def ios_test(args: dict) -> dict:
         if not FLEET_LARGE_ARN:
             return {
                 "status": "ERROR",
+                "reason": "NO_LARGE_FLEET",
                 "message": "compute_size=large requested but no large fleet is "
                            "enabled (deploy with enableLarge). Retry with "
                            "compute_size=medium.",
@@ -100,6 +121,16 @@ def ios_test(args: dict) -> dict:
     # a shared cache key makes them restore each other's DerivedData, which fails
     # Swift's incremental validity check -> full recompile + mutual clobber.
     env.append({"name": "COMPUTE_SIZE", "value": size, "type": "PLAINTEXT"})
+
+    # Capacity preflight. A non-ACTIVE or wedged fleet still ACCEPTS StartBuild and
+    # then never runs it, so the agent gets a build_id it can poll for hours
+    # (TEAM-4921 left running:0 queued:3). Refuse up front instead, and say what to
+    # do about it. force=true enqueues anyway; the check is best-effort and never
+    # blocks a build because of a read permission or a throttle.
+    if not args.get("force"):
+        err = _capacity_preflight(size)
+        if err:
+            return err
 
     resp = codebuild.start_build(**start)
     build = resp["build"]
@@ -140,6 +171,10 @@ def ios_build_status(args: dict) -> dict:
         return {"status": "IN_PROGRESS", "build_id": build_id,
                 "compute_size": _compute_size(build),
                 "current_phase": build.get("currentPhase", ""),
+                # How long this build has waited for a fleet instance. Still rising
+                # while current_phase is QUEUED; a value climbing past a few minutes
+                # with no other build running means the fleet is wedged, not busy.
+                "queued_seconds": _queued_seconds(build),
                 "phases": phases}
 
     duration = _duration(build)
@@ -171,12 +206,27 @@ def ios_build_status(args: dict) -> dict:
         status = "BUILD_ERROR"
     if cb_status == "TIMED_OUT":
         status = "TIMED_OUT"
+    # Queued timeout: with a queuedTimeout on the project, a build that no fleet
+    # instance ever picked up ends with QUEUED as its last non-succeeded phase. That
+    # is an infrastructure fault, not a test/compile failure, so report it as
+    # BUILD_ERROR and lead with what to do. Keyed on the PHASE rather than on
+    # TIMED_OUT, since CodeBuild may label the overall build FAILED instead.
+    if status != "SUCCEEDED" and _last_unsucceeded_phase(build) == "QUEUED":
+        status = "BUILD_ERROR"
+        build_errors.insert(
+            0,
+            f"Timed out in QUEUED after {_queued_seconds(build) // 60} min: no fleet "
+            "instance picked the build up (fleet unhealthy / disk full). Recycle the "
+            "fleet instance - see docs/RUNBOOK-runner-disk-full.md. ios_list_builds "
+            "shows the fleet's queue state.",
+        )
 
     return {
         "status": status,
         "build_id": build_id,
         "compute_size": _compute_size(build),
         "duration_seconds": duration,
+        "queued_seconds": _queued_seconds(build),
         "test_summary": summary,
         "failures": failures,
         "artifacts": artifacts,
@@ -314,13 +364,17 @@ def ios_list_builds(args: dict) -> dict:
     # PASSING sortOrder errors once a project has >100 builds. This stack
     # accumulates many runs, so we rely on the default order.
     ids = codebuild.list_builds_for_project(
-        projectName=PROJECT).get("ids", [])[:limit]
+        projectName=PROJECT).get("ids", [])[:50]
     if not ids:
-        return {"builds": [], "running": 0, "queued": 0}
+        return {"builds": [], "running": 0, "queued": 0, "fleets": _fleets_summary([])}
     builds = codebuild.batch_get_builds(ids=ids).get("builds", [])
+    # Per-fleet queue + health view, computed over ALL sizes from this same fetch and
+    # independent of `limit`/`compute_size` — so a stalled fleet is visible even when
+    # the caller asked for a narrow slice. One BatchGetBuilds either way.
+    fleets = _fleets_summary(builds)
     want = args.get("compute_size")  # optional filter: "medium" | "large"
     out, running, queued = [], 0, 0
-    for b in builds:
+    for b in builds[:limit]:
         size = _compute_size(b)
         if want and size != want:
             continue
@@ -337,8 +391,11 @@ def ios_list_builds(args: dict) -> dict:
             "current_phase": phase,
             "compute_size": size,
             "duration_seconds": _duration(b),
+            "queued_seconds": _queued_seconds(b),
         })
-    return {"builds": out, "running": running, "queued": queued}
+    # running/queued keep their existing meaning (this slice, after the filter);
+    # `fleets` is the whole-project, per-size view.
+    return {"builds": out, "running": running, "queued": queued, "fleets": fleets}
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +507,171 @@ def _compute_size(build: dict) -> str:
     ct = (build.get("environment", {}) or {}).get("computeType", "")
     return {"BUILD_GENERAL1_LARGE": "large",
             "BUILD_GENERAL1_MEDIUM": "medium"}.get(ct, ct or "unknown")
+
+
+def _fleet_arn(size: str) -> str:
+    """Fleet ARN for a friendly size. '' when that fleet isn't deployed."""
+    return FLEET_LARGE_ARN if size == "large" else FLEET_MEDIUM_ARN
+
+
+def _fleet_status(arn: str):
+    """(statusCode, message) for one fleet ARN; (None, msg) when it no longer exists.
+
+    Needs codebuild:BatchGetFleets. statusCode is ACTIVE for a healthy fleet;
+    CREATING/UPDATING/ROTATING are transient, CREATE_FAILED /
+    UPDATE_ROLLBACK_FAILED / PENDING_DELETION / DELETING are not.
+    """
+    fleets = codebuild.batch_get_fleets(names=[arn]).get("fleets", [])
+    if not fleets:
+        return None, f"fleet not found ({arn})"
+    st = fleets[0].get("status", {}) or {}
+    msg = "; ".join(x for x in (st.get("context"), st.get("message")) if x)
+    return st.get("statusCode", ""), msg
+
+
+def _queued_seconds(build: dict) -> int:
+    """How long a build waited (or has been waiting) in QUEUED.
+
+    CodeBuild reports durationInSeconds once the phase ends; while the build is
+    still sitting there the phase has no end, so measure against its startTime.
+    0 when the build never queued.
+    """
+    for p in build.get("phases", []):
+        if p.get("phaseType") != "QUEUED":
+            continue
+        if p.get("endTime"):
+            return int(p.get("durationInSeconds") or 0)
+        start = p.get("startTime") or build.get("startTime")
+        if not start:
+            return 0
+        return max(0, int(datetime.now(timezone.utc).timestamp() - start.timestamp()))
+    return 0
+
+
+def _queue_snapshot(builds=None) -> dict:
+    """Per-size queue state: running, queued, oldest_queued_seconds, stalled,
+    queued_build_ids.
+
+    `stalled` = builds are QUEUED, NOTHING is running on that size, and the oldest
+    has waited longer than FLEET_STALL_MINUTES — i.e. the fleet instance is wedged
+    rather than busy. Pass an already-fetched build list to skip a second
+    ListBuildsForProject + BatchGetBuilds round trip; shared by the ios_test
+    preflight and the ios_list_builds fleet view.
+    """
+    snap = {}
+    for size in ("medium", "large"):
+        if size == "large" and not FLEET_LARGE_ARN:
+            continue    # not deployed; don't report a fleet that doesn't exist
+        snap[size] = {"running": 0, "queued": 0, "oldest_queued_seconds": 0,
+                      "stalled": False, "queued_build_ids": []}
+    if builds is None:
+        ids = codebuild.list_builds_for_project(projectName=PROJECT).get("ids", [])[:50]
+        builds = codebuild.batch_get_builds(ids=ids).get("builds", []) if ids else []
+    for b in builds:
+        entry = snap.get(_compute_size(b))
+        if entry is None or b.get("buildStatus") != "IN_PROGRESS":
+            continue
+        if b.get("currentPhase") == "QUEUED":
+            entry["queued"] += 1
+            entry["queued_build_ids"].append(b.get("id", ""))
+            entry["oldest_queued_seconds"] = max(entry["oldest_queued_seconds"],
+                                                 _queued_seconds(b))
+        else:
+            entry["running"] += 1
+    for entry in snap.values():
+        entry["stalled"] = (entry["queued"] > 0 and entry["running"] == 0
+                            and entry["oldest_queued_seconds"] > FLEET_STALL_MINUTES * 60)
+    return snap
+
+
+def _fleets_summary(builds=None) -> dict:
+    """_queue_snapshot plus each fleet's own health, keyed by size.
+
+    fleet_status is 'unreadable' when codebuild:BatchGetFleets is denied — the queue
+    numbers still hold, since they need no permission beyond what status already uses.
+    """
+    snap = _queue_snapshot(builds)
+    for size, entry in snap.items():
+        arn = _fleet_arn(size)
+        if not arn:
+            continue
+        try:
+            code, _msg = _fleet_status(arn)
+            entry["fleet_status"] = code or "NOT_FOUND"
+        except Exception as e:
+            print(f"fleet status unreadable for {size}: {type(e).__name__}: {e}")
+            entry["fleet_status"] = "unreadable"
+    return snap
+
+
+def _capacity_preflight(size: str):
+    """Error dict when starting a build on `size` would just park it in QUEUED
+    forever, else None.
+
+    Best-effort by design: this tool must never become unusable because a read
+    permission is missing or an API throttled, so each check swallows its own
+    exceptions (logged to the Lambda log) and the build proceeds. The two checks are
+    independent — a denied BatchGetFleets still leaves the stall detection working.
+    """
+    try:
+        arn = _fleet_arn(size)
+        if arn:
+            code, msg = _fleet_status(arn)
+            if code != "ACTIVE":
+                shown = code or "NOT_FOUND"
+                transient = shown in ("CREATING", "UPDATING", "ROTATING")
+                return {
+                    "status": "ERROR",
+                    "reason": "INSUFFICIENT_CAPACITY",
+                    "compute_size": size,
+                    "fleet_status": shown,
+                    "message": f"The {size} MAC_ARM fleet is not ACTIVE (status {shown})"
+                               + (f": {msg}" if msg else "")
+                               + ". A build started now would sit in QUEUED instead of running.",
+                    "remediation": ("The fleet is still coming up - retry in a few minutes."
+                                    if transient else
+                                    "The fleet needs operator attention (recycle or recreate it); "
+                                    "see docs/RUNBOOK-runner-disk-full.md.")
+                                   + " Pass force=true to enqueue anyway.",
+                }
+    except Exception as e:
+        print(f"fleet status check skipped: {type(e).__name__}: {e}")
+
+    try:
+        queue = _queue_snapshot().get(size) or {}
+    except Exception as e:
+        print(f"queue stall check skipped: {type(e).__name__}: {e}")
+        return None
+    if queue.get("stalled"):
+        return {
+            "status": "ERROR",
+            "reason": "INSUFFICIENT_CAPACITY",
+            "compute_size": size,
+            "fleet_status": "ACTIVE",
+            "stalled_builds": queue.get("queued_build_ids", []),
+            "oldest_queued_seconds": queue.get("oldest_queued_seconds", 0),
+            "message": f"The {size} fleet looks stalled: {queue['queued']} build(s) QUEUED, "
+                       f"none running, oldest waiting {queue['oldest_queued_seconds'] // 60} min "
+                       f"(> {FLEET_STALL_MINUTES} min). The instance is wedged (unhealthy or out "
+                       "of disk), so this build would queue behind them indefinitely.",
+            "remediation": "Inspect the stalled builds with get_build_log, cancel them with "
+                           "ios_cancel, and recycle the fleet instance - see "
+                           "docs/RUNBOOK-runner-disk-full.md. Pass force=true to enqueue anyway.",
+        }
+    return None
+
+
+def _last_unsucceeded_phase(build: dict) -> str:
+    """phaseType of the last phase that did not SUCCEED, '' when all did.
+
+    Identifies WHERE a build died without depending on how CodeBuild labels the
+    overall buildStatus (a queued timeout can surface as FAILED or TIMED_OUT).
+    """
+    for p in reversed(build.get("phases", [])):
+        st = p.get("phaseStatus")
+        if st and st != "SUCCEEDED":
+            return p.get("phaseType", "")
+    return ""
 
 
 def _get_metrics(build_id: str) -> dict:
