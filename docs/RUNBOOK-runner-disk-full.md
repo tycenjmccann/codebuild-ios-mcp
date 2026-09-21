@@ -19,10 +19,17 @@ wedged with nothing running. This is what happened to build
 - `ios_build_status` returns `status: "BUILD_ERROR"` with a `build_errors[0]`
   starting `Timed out in QUEUED` — no instance ever picked the build up before
   the project's `queuedTimeout` (default 60 min).
+- The build dies immediately with `ERROR: could not fetch
+  s3://<bucket>/tooling/ios-build.sh` (followed by a `df -Pk` dump, in the
+  CloudWatch log / `get_build_log` tail — no `build_output.log` is uploaded in
+  this case). The buildspec is only a stub; the build body is fetched from S3.
+  Two causes: the tooling was never deployed (run `cdk deploy`, which uploads
+  `tooling/` via the BucketDeployment), or the runner is so full it cannot hold a
+  31 KB download — which is past what the in-script guard can fix, so go to step 3.
 
 ## What the guard now does
 
-`buildspec.yaml`'s disk guard runs on every build (not just when disk state
+`tooling/ios-build.sh`'s disk guard runs on every build (not just when disk state
 already existed), measures `$HOME` (the Data volume — `/` is the sealed APFS
 System volume and under-reports), and reclaims in tiers, cheapest loss first,
 re-measuring between each and stopping as soon as it's healthy:

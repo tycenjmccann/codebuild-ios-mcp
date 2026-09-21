@@ -17,16 +17,24 @@ architecture, deploy steps, and cost warning.
 | `lib/codebuild-ios-mcp-stack.ts` | The stack: S3 bucket, MAC_ARM fleet, CodeBuild project, Lambda, gateway invoke role, outputs |
 | `lambda/handler.py` | The seven MCP tools (`ios_test`, `ios_build_status`, `list_schemes`, `get_test_logs`, `get_build_log`, `ios_list_builds`, `ios_cancel`) |
 | `tooling/xcresult_to_junit.py` | xcresult to JUnit converter, deployed to `s3://<bucket>/tooling/` |
-| `buildspec.yaml` | Embedded inline into the CodeBuild project — single source of truth for build behavior |
+| `tooling/ios-build.sh` | The build body (disk guard, warm cache, xcodebuild, artifacts, metrics); deployed to `s3://<bucket>/tooling/`, fetched and run by the buildspec stub |
+| `buildspec.yaml` | Embedded inline into the CodeBuild project — the stub + `env`/`reports`/`artifacts` |
 | `gateway-tools.json` | Inline tool schema for the Gateway lambda target |
 | `scripts/register-gateway.sh` | One-time post-deploy: create gateway + lambda target from stack outputs |
 | `scripts/deregister-gateway.sh` | Delete target(s) + gateway |
 
 ## Key facts when editing
 
-- **The buildspec is the source of truth.** It is read at synth time and embedded
-  inline. Edit `buildspec.yaml` + `cdk deploy` to change build behavior; the iOS
-  repo under test needs no buildspec.
+- **Build behavior = `buildspec.yaml` (stub + env) + `tooling/ios-build.sh` (body),
+  both deployed by `cdk deploy`.** The buildspec is read at synth time and embedded
+  inline; its one build command fetches `s3://$ARTIFACTS_BUCKET/tooling/ios-build.sh`
+  and runs it. The split exists because CodeBuild caps an **inline buildspec at
+  25,600 bytes** (hit for real: `a4bc8ef` hand-trimmed the live project to 25,550 B)
+  and the body is ~31 KB; the stack throws at synth if the serialized buildspec
+  exceeds that cap. The `tooling/` BucketDeployment runs in the same `cdk deploy`,
+  so stub and body never skew — but a behavior change still needs a deploy, and
+  hand-editing the S3 object is pointless (the next deploy overwrites it). The iOS
+  repo under test still needs no buildspec.
 - **MAC_ARM fleet uses `AWS::CodeBuild::Fleet` (`CfnFleet`)** — no L2/L1 construct
   exists. The Project L2 has no fleet prop, so the fleet ARN is applied via an
   escape hatch (`addPropertyOverride('Environment.Fleet.FleetArn', ...)`). Keep
@@ -42,8 +50,9 @@ architecture, deploy steps, and cost warning.
   `Stack.of(this)`; IAM scopes to specific project, report-group, and bucket
   ARNs. Do not introduce `*` resources or hardcoded account ids.
 - **Do not use em dashes in AWS resource names** — use hyphens.
-- **The buildspec's disk guard and warm-cache save gate are a matched pair**
-  (TEAM-4921): the guard fails fast on a full runner, the save gate refuses to
+- **The build body's disk guard and warm-cache save gate are a matched pair**
+  (both in `tooling/ios-build.sh`, TEAM-4921): the guard fails fast on a full
+  runner, the save gate refuses to
   publish state from a run that hit ENOSPC or produced no result bundle. Edit
   them together. The Lambda's fleet capacity/stall preflight (`ios_test`,
   `ios_list_builds`) depends on `codebuild:BatchGetFleets` being granted per

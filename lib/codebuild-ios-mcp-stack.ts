@@ -86,6 +86,7 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
  *   - S3 artifacts bucket (private, lifecycle-expired, seeded with the xcresult converter)
  *   - A reserved MAC_ARM CodeBuild fleet (CfnFleet; no L2 construct exists)
  *   - A CodeBuild project that references the fleet and embeds buildspec.yaml inline
+ *     (the stub; the build body ships as tooling/ios-build.sh in the same bucket)
  *   - A python3.12 Lambda hosting the four MCP tools
  *   - An IAM role the AgentCore Gateway assumes to invoke the Lambda
  *
@@ -141,7 +142,9 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       ],
     });
 
-    // The buildspec fetches s3://<bucket>/tooling/xcresult_to_junit.py at runtime.
+    // Ships the whole tooling/ dir: the build fetches s3://<bucket>/tooling/
+    // ios-build.sh (the build body, too big to inline) and xcresult_to_junit.py
+    // at runtime. Same deploy as the buildspec stub, so the two never skew.
     new s3deploy.BucketDeployment(this, 'ToolingDeployment', {
       destinationBucket: artifactsBucket,
       destinationKeyPrefix: 'tooling',
@@ -331,15 +334,34 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     );
 
     // ----------------------------------------------------------------------- //
-    // CodeBuild project. The buildspec.yaml at the repo root is the SINGLE
-    // SOURCE OF TRUTH: it is read at synth time and embedded inline so the
-    // user's iOS repo needs no buildspec file. Edit buildspec.yaml + redeploy
-    // to update build behavior.
+    // CodeBuild project. Build behavior lives in two files, both shipped by this
+    // deploy: buildspec.yaml (stub + env/reports/artifacts) is read at synth time
+    // and embedded inline, and tooling/ios-build.sh (the shell body the stub
+    // fetches from s3://<bucket>/tooling/) goes up with the ToolingDeployment
+    // above. The user's iOS repo still needs no buildspec file.
     // ----------------------------------------------------------------------- //
     const buildspecPath = path.join(__dirname, '..', 'buildspec.yaml');
     const buildspecObject = yaml.load(fs.readFileSync(buildspecPath, 'utf8')) as {
       [key: string]: unknown;
     };
+
+    // CodeBuild rejects an inline buildspec larger than 25600 bytes, and `cdk
+    // synth` does NOT catch it: only `cdk deploy` fails, after the fleet is
+    // already billing. We hit this for real - a4bc8ef had to hand-trim the live
+    // project's inline buildspec to 25550 B to fit. So fail fast here, and keep
+    // the ~31 KB shell body in tooling/ios-build.sh rather than trimming
+    // comments to squeeze back under. toBuildSpec() returns exactly the string
+    // that lands in the template.
+    const INLINE_BUILDSPEC_MAX_BYTES = 25600;
+    const buildSpec = codebuild.BuildSpec.fromObjectToYaml(buildspecObject);
+    const buildSpecBytes = Buffer.byteLength(buildSpec.toBuildSpec(), 'utf8');
+    if (buildSpecBytes > INLINE_BUILDSPEC_MAX_BYTES) {
+      throw new Error(
+        `buildspec.yaml serializes to ${buildSpecBytes} bytes inline, over CodeBuild's ` +
+          `${INLINE_BUILDSPEC_MAX_BYTES}-byte cap (see a4bc8ef). Move shell out of the ` +
+          'build command into tooling/ios-build.sh, which the stub fetches at runtime.',
+      );
+    }
 
     // No CodeBuild cache construct: warm DerivedData + resolved SPM persist in
     // $HOME/ios-mcp-state on the reserved Mac (the instance stays alive between
@@ -354,7 +376,7 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         repo: parseGitHubRepo(props.githubRepo),
         branchOrRef: props.sourceVersion,
       }),
-      buildSpec: codebuild.BuildSpec.fromObjectToYaml(buildspecObject),
+      buildSpec,
       role: codeBuildRole,
       timeout: cdk.Duration.minutes(40),
       // Cap the QUEUED wait. Without this, CodeBuild's 8h default means a build no

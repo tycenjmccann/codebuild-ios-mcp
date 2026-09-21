@@ -18,7 +18,7 @@ test failures); while a build runs it returns a live CloudWatch log tail.
 
 ## Runner hardening (TEAM-4921 — already solved, don't reintroduce the bugs)
 
-- The buildspec's disk guard runs on every build, fails fast with
+- `tooling/ios-build.sh`'s disk guard runs on every build, fails fast with
   `runner disk full` when tiered reclaim isn't enough, and is never a no-op —
   don't gate it behind `[ -d "$WARM_ROOT" ]` again.
 - The warm cache is never saved from a run that hit ENOSPC or produced no
@@ -47,9 +47,22 @@ test failures); while a build runs it returns a live CloudWatch log tail.
 
 ## Source-of-truth files (edit these, not generated output)
 
-- `buildspec.yaml` — build behavior. Read at synth time and embedded inline into
-  the project; the iOS repo under test needs no buildspec. One shell block on
-  purpose (CodeBuild runs each list item in a fresh CWD). Edit + redeploy.
+- `buildspec.yaml` — the **stub** + `env.variables`/`reports`/`artifacts`. Read at
+  synth time and embedded inline; the iOS repo under test needs no buildspec. Its
+  single build command fetches `s3://$ARTIFACTS_BUCKET/tooling/ios-build.sh` and
+  `bash`es it, propagating the exit code.
+- `tooling/ios-build.sh` — the **build body** (~31 KB: disk guard, warm cache
+  restore/save, secrets hydration, scheme/platform probing, `xcodebuild test`,
+  artifacts, metrics). One script on purpose: CodeBuild runs each buildspec list
+  item in a fresh CWD, so state (cd, vars) has to live in one shell. It is not
+  inline because CodeBuild caps an inline buildspec at **25,600 bytes** — hit for
+  real (`a4bc8ef` hand-trimmed the live project to 25,550 B); the stack now throws
+  at synth if the serialized buildspec exceeds the cap. It inherits CodeBuild's
+  env (`CODEBUILD_*`, `ARTIFACTS_BUCKET`, `SCHEME`/`DEVICE`/… ) as a child process.
+  Deploy-time coupling: the `tooling/` BucketDeployment and the project update in
+  the **same `cdk deploy`**, so stub and body can't skew. Edit the script +
+  redeploy; don't hand-edit the S3 object (the next deploy overwrites it), and a
+  build already running keeps the copy it fetched at phase start.
   Visual evidence: after tests it runs `xcresulttool export attachments` to pull
   every `XCTAttachment` image out of the xcresult, bundles all images + final
   frame + optional `session.mp4` into `builds/<id>/assets.zip`, and also drops the
@@ -89,7 +102,7 @@ Private repo: `aws codebuild import-source-credentials --server-type GITHUB
 --auth-type PERSONAL_ACCESS_TOKEN --token <pat>` once per account/region first.
 
 Cache (fix→retest loop): builds are incremental out of the box, no flag. The
-reserved Mac stays alive between builds, so the buildspec points Xcode at a
+reserved Mac stays alive between builds, so the build script points Xcode at a
 stable build-user-owned `$HOME/ios-mcp-state` (DerivedData + resolved SPM); the
 next build on the warm instance recompiles only what changed. Do NOT reintroduce
 CodeBuild's `cache:` feature — `LOCAL_CUSTOM_CACHE` symlinks through a root-owned
@@ -136,6 +149,9 @@ with its execution role's ambient creds. Just grant that role
 ```bash
 # Lambda unit tests (stdlib unittest, no deps beyond boto3):
 python3 -m unittest discover -s lambda -p 'test_*.py' -v
+
+# Build body syntax (shellcheck isn't assumed to be installed; bash -n always works):
+bash -n tooling/ios-build.sh && echo OK
 
 # Always synth before claiming a stack change works:
 npx cdk synth -c codebuild-ios-mcp:githubRepo=https://github.com/x/y -c codebuild-ios-mcp:projectDir=ios >/dev/null && echo OK
