@@ -38,6 +38,24 @@ phases:
         PHASES="$CODEBUILD_SRC_DIR/phase_times.txt"; : > "$PHASES"
         mark() { echo "$1 $(date +%s)" >> "$PHASES"; }
 
+        # Disk telemetry. Defined out here because run() is piped to tee (subshell),
+        # so the metrics block below cannot see anything run() sets.
+        # macOS APFS: `/` is the sealed System volume, whose Capacity% counts only
+        # its own (tiny) used bytes and reads healthy while the Data volume that
+        # actually fills is at 100%. $HOME is on the Data volume -> measure there.
+        # Free GB, not %, is the signal that matters. `df -Pk`: POSIX output (one
+        # line per fs, no wrap on long device names) in 1024-byte blocks;
+        # $4 = Available, $5 = Capacity%.
+        DISK_VOL="$HOME"; [ -d "$DISK_VOL" ] || DISK_VOL="/"
+        disk_read() {
+          DISK_STAT=$(df -Pk "$DISK_VOL" 2>/dev/null | awk 'NR==2{gsub("%","",$5); printf "%d %d", $5, int($4/1048576)}')
+          [ -n "$DISK_STAT" ] || DISK_STAT=$(df -Pk / 2>/dev/null | awk 'NR==2{gsub("%","",$5); printf "%d %d", $5, int($4/1048576)}')
+          DISK_PCT=${DISK_STAT%% *}; DISK_FREE_GB=${DISK_STAT##* }
+          case "$DISK_PCT"     in ''|*[!0-9]*) DISK_PCT=0 ;; esac
+          case "$DISK_FREE_GB" in ''|*[!0-9]*) DISK_FREE_GB=0 ;; esac
+        }
+        DISK_STATS="$CODEBUILD_SRC_DIR/disk_stats.txt"
+
         run() {
           mark start
           BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
@@ -48,37 +66,100 @@ phases:
           # state); back it with S3 since reserved fleets have no build-instance affinity.
           WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
 
-          # --- disk guard: warm state grows unbounded on the reserved (persistent-
-          # disk) fleet — every repo+subdir+size adds a full DerivedData/SPM/src tree
-          # and nothing prunes it, so the instance eventually fills and DOWNLOAD_SOURCE
-          # fails before this buildspec even runs. Before doing anything expensive,
-          # evict least-recently-used per-repo state dirs until the root FS is back
-          # under DISK_HIGH_PCT. S3 is the source of truth (each repo re-restores on
-          # its next build), so eviction only ever costs a one-time cold compile.
-          DISK_HIGH_PCT="${DISK_HIGH_PCT:-85}"   # start evicting above this %used
-          DISK_LOW_PCT="${DISK_LOW_PCT:-70}"     # stop once back under this %used
-          disk_pct() { df -P / | awk 'NR==2{gsub("%","",$5); print $5}'; }
-          if [ -d "$WARM_ROOT" ]; then
-            USED=$(disk_pct)
-            if [ "${USED:-0}" -ge "$DISK_HIGH_PCT" ]; then
-              echo "Disk ${USED}% >= ${DISK_HIGH_PCT}% -> evicting LRU warm-state dirs (S3-backed, safe)"
-              # oldest-mtime first; skip the dir we're about to use this run.
-              ls -dt "$WARM_ROOT"/*/ 2>/dev/null | tail -r 2>/dev/null | while read -r d; do
-                [ -d "$d" ] || continue
-                U=$(disk_pct); [ "${U:-0}" -lt "$DISK_LOW_PCT" ] && break
-                echo "  evict $(basename "$d") ($(du -sh "$d" 2>/dev/null | cut -f1))"
-                rm -rf "$d"
-              done
-              echo "Disk after eviction: $(disk_pct)%"
-            fi
-          fi
-
           # SRC_KEY = repo+subdir+size (medium/large are separate fleets; cross-size
           # restore fails Swift's incremental check, so each size keys its own cache).
+          # Computed BEFORE the disk guard so eviction can skip THIS run's state dir.
           SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_' )
           REPO_STATE="$WARM_ROOT/$SRC_KEY"
           STABLE_SRC="$REPO_STATE/src"
           S3_CACHE="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.tar.gz"
+
+          # --- disk guard: the reserved fleet has a persistent disk and several
+          # unbounded consumers - warm state (one DerivedData/SPM/src tree per
+          # repo+subdir+size), the SwiftPM global cache, leaked /tmp/ios-mcp-clean-*
+          # trees from clean_build runs, stale /tmp/codebuild-* source roots. When it
+          # fills, every step ENOSPCs for minutes and the run dies opaquely (TEAM-4921).
+          # So: measure the Data volume, reclaim in tiers cheapest-first, and if that
+          # is not enough FAIL IN SECONDS with a distinctive line. Runs
+          # unconditionally; the healthy path is one df + one log line.
+          DISK_HIGH_PCT="${DISK_HIGH_PCT:-85}"        # start reclaiming above this %used
+          DISK_LOW_PCT="${DISK_LOW_PCT:-70}"          # stop once back under this %used
+          # Floor for starting a build at all: a warm repo state is ~10-20 GB
+          # uncompressed and a cold SwiftPM resolve pulls tens of packages; the S3 save
+          # streams tar|gzip|aws s3 cp so it needs no extra disk. 20 GB is enough for
+          # one cold repo without evicting on a healthy instance. Heuristic, not a
+          # guarantee - override per project/build via the env var.
+          DISK_MIN_FREE_GB="${DISK_MIN_FREE_GB:-20}"
+          RECLAIMED_KB=0
+          reclaim() {   # $1=path $2=label; log size, delete, accumulate
+            [ -e "$1" ] || return 0
+            R_KB=$(du -sk "$1" 2>/dev/null | awk '{print $1}'); R_KB=${R_KB:-0}
+            echo "  reclaim [$2] $1 ($(awk -v k="$R_KB" 'BEGIN{printf "%.1f", k/1048576}') GB)"
+            rm -rf "$1" 2>/dev/null
+            RECLAIMED_KB=$(( RECLAIMED_KB + R_KB ))
+          }
+          disk_ok() { disk_read; [ "$DISK_PCT" -lt "$DISK_LOW_PCT" ] && [ "$DISK_FREE_GB" -ge "$DISK_MIN_FREE_GB" ]; }
+
+          disk_read; DISK_PCT_START=$DISK_PCT; DISK_FREE_START=$DISK_FREE_GB
+          echo "Disk ($DISK_VOL): ${DISK_PCT}% used, ${DISK_FREE_GB} GB free (reclaim above ${DISK_HIGH_PCT}% or below ${DISK_MIN_FREE_GB} GB free)"
+          if [ "$DISK_PCT" -ge "$DISK_HIGH_PCT" ] || [ "$DISK_FREE_GB" -lt "$DISK_MIN_FREE_GB" ]; then
+            echo "Disk pressure -> tiered reclaim (S3 is the source of truth for warm state)"
+            # This build's own CodeBuild source root, so tier 2 never deletes it.
+            CB_ROOT=""
+            case "$CODEBUILD_SRC_DIR" in
+              /tmp/codebuild-*) CB_ROOT="/tmp/$(printf '%s' "${CODEBUILD_SRC_DIR#/tmp/}" | cut -d/ -f1)" ;;
+            esac
+            TIER=0
+            while [ "$TIER" -lt 6 ]; do
+              disk_ok && break        # one df per tier; stop as soon as we are healthy
+              TIER=$(( TIER + 1 ))
+              case "$TIER" in
+                1) # throwaway clean_build DerivedData from earlier runs; never reused
+                   for d in /tmp/ios-mcp-clean-*; do
+                     [ -d "$d" ] || continue
+                     [ "$d" = "/tmp/ios-mcp-clean-${CODEBUILD_BUILD_NUMBER:-0}" ] && continue
+                     reclaim "$d" clean-build-leftover
+                   done ;;
+                2) # source roots left by finished builds; ours and anything fresh is skipped
+                   for d in /tmp/codebuild-*; do
+                     [ -d "$d" ] || continue
+                     [ -n "$CB_ROOT" ] && [ "$d" = "$CB_ROOT" ] && continue
+                     case "$CODEBUILD_SRC_DIR" in "$d"/*) continue ;; esac
+                     [ -n "$(find "$d" -maxdepth 0 -mmin +60 2>/dev/null)" ] || continue
+                     reclaim "$d" stale-codebuild-root
+                   done ;;
+                3) reclaim "$HOME/Library/Caches/org.swift.swiftpm" swiftpm-cache   # SPM re-fetches
+                   reclaim "$HOME/Library/Caches/com.apple.dt.Xcode" xcode-cache ;;
+                4) reclaim "$HOME/Library/Developer/Xcode/DerivedData" stock-derived-data ;;  # we never use it
+                5) reclaim "$HOME/Library/Developer/CoreSimulator/Caches" simulator-caches
+                   reclaim "$HOME/Library/Logs/CoreSimulator" simulator-logs
+                   echo "  simctl delete unavailable"; xcrun simctl delete unavailable >/dev/null 2>&1 ;;
+                6) # LRU warm state, oldest first, skipping THIS run's dir. ls -dt is
+                   # newest-first; tail -r (BSD) reverses it. Read from a file, not a
+                   # pipeline, so `break` and RECLAIMED_KB survive (as with the secrets TSV).
+                   LRU_LIST="/tmp/ios-mcp-lru.$$"
+                   ls -dt "$WARM_ROOT"/*/ 2>/dev/null | tail -r > "$LRU_LIST" 2>/dev/null
+                   while read -r d; do
+                     d="${d%/}"; [ -d "$d" ] || continue
+                     [ "$d" = "$REPO_STATE" ] && continue
+                     disk_ok && break
+                     reclaim "$d" lru-warm-state
+                   done < "$LRU_LIST"
+                   rm -f "$LRU_LIST" ;;
+              esac
+            done
+            disk_read
+            echo "Disk after reclaim: ${DISK_PCT}% used, ${DISK_FREE_GB} GB free ($(awk -v k="$RECLAIMED_KB" 'BEGIN{printf "%.1f", k/1048576}') GB reclaimed, tiers 1-$TIER)"
+          fi
+          # Headroom -> metrics.json (this runs in tee's subshell, so via a file).
+          printf 'disk_vol=%s\ndisk_pct_start=%s\ndisk_free_gb_start=%s\ndisk_pct_after_reclaim=%s\ndisk_free_gb_after_reclaim=%s\ndisk_reclaimed_gb=%s\n' \
+            "$DISK_VOL" "$DISK_PCT_START" "$DISK_FREE_START" "$DISK_PCT" "$DISK_FREE_GB" \
+            "$(awk -v k="$RECLAIMED_KB" 'BEGIN{printf "%.1f", k/1048576}')" > "$DISK_STATS" 2>/dev/null || true
+          if [ "$DISK_FREE_GB" -lt "$DISK_MIN_FREE_GB" ]; then
+            echo "ERROR: runner disk full (${DISK_FREE_GB} GB free after eviction, need ${DISK_MIN_FREE_GB}) - recycle the fleet instance"
+            echo "       nothing evictable left on $DISK_VOL; see docs/RUNBOOK-runner-disk-full.md"
+            return 1
+          fi
 
           # Restore from S3 only when cold for this repo (no local DerivedData) and
           # not a forced clean build. S3_HAD_CACHE gates the save (seed once if empty).
@@ -257,6 +338,9 @@ phases:
           # so newer .o/.swiftmodule = this run's recompiles).
           BUILD_SENTINEL="$REPO_STATE/.build_sentinel"
           mkdir -p "$REPO_STATE"; : > "$BUILD_SENTINEL"
+          # Stamp last-use so the guard's tier-6 LRU order means "least recently
+          # BUILT" (writes land in subdirs and don't bump the parent's mtime).
+          touch "$REPO_STATE" 2>/dev/null || true
 
           echo "=== xcodebuild test ==="
           mark test_start
@@ -302,7 +386,6 @@ phases:
                && [ -n "${CACHE_SAVE_THRESHOLD:-}" ] && [ "$COMPILES" -lt "$CACHE_SAVE_THRESHOLD" ]; then
               SAVE=0; REASON="below threshold ($COMPILES<$CACHE_SAVE_THRESHOLD)"
             fi
-
             CACHE_SAVED=false
             if [ "$SAVE" = "1" ]; then
               echo "Saving warm cache -> $S3_CACHE ($REASON; $COMPILES recompiled)"
@@ -333,11 +416,15 @@ phases:
         run 2>&1 | tee "$LOG"
         TEST_RC=${PIPESTATUS[0]}
 
+        # Closing headroom (disk_stats.txt exists unless run() died before the guard).
+        disk_read
+        printf 'disk_pct_end=%s\ndisk_free_gb_end=%s\n' "$DISK_PCT" "$DISK_FREE_GB" >> "$DISK_STATS" 2>/dev/null || true
+
         # Diagnostics: always upload raw log + focused error tail so a pre-test
         # failure still surfaces via get_build_log / ios_build_status build_errors.
         {
           echo "=== error / failure lines ===";
-          grep -nE 'error:|fatal error|\*\* (BUILD|TEST|CLEAN) FAILED|xcodebuild: error|Code=|No such|not found|Unable to|Could not|Testing cancelled|Linker command failed' "$LOG" | tail -120;
+          grep -nE 'error:|fatal error|\*\* (BUILD|TEST|CLEAN) FAILED|xcodebuild: error|Code=|No such|not found|Unable to|Could not|Testing cancelled|Linker command failed|No space left on device|out of space|runner disk full|ENOSPC' "$LOG" | tail -120;
           echo; echo "=== last 100 lines ==="; tail -100 "$LOG";
         } > "$CODEBUILD_SRC_DIR/error_tail.txt" 2>/dev/null || true
         aws s3 cp "$LOG" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/build_output.log" || true
@@ -425,9 +512,23 @@ phases:
         METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_')
         python3 - "$LOG" "$PHASES" "$CODEBUILD_SRC_DIR/summary.json" \
                  "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" \
-                 "$CODEBUILD_SRC_DIR/cache_decision.txt" <<'PY' || true
+                 "$CODEBUILD_SRC_DIR/cache_decision.txt" "$DISK_STATS" <<'PY' || true
         import json, re, sys
-        log, phases_f, summ_f, out, build_id, src_key, cache_f = sys.argv[1:8]
+        log, phases_f, summ_f, out, build_id, src_key, cache_f, disk_f = sys.argv[1:9]
+        def kv(p):
+            """Parse a k=v file written by the build shell; missing file -> {}."""
+            d = {}
+            try:
+                for ln in open(p):
+                    k, _, v = ln.strip().partition("=")
+                    if k: d[k] = v
+            except Exception: pass
+            return d
+        def num(v):
+            try: return int(v)
+            except Exception:
+                try: return float(v)
+                except Exception: return None
         def secs(a, b, p):
             t = {}
             try:
@@ -444,12 +545,8 @@ phases:
         state = "cold" if compiles > 800 else ("warm" if compiles < 150 else "partial")
         try: summ = json.load(open(summ_f))
         except Exception: summ = {}
-        cache = {}
-        try:
-            for ln in open(cache_f):
-                k, _, v = ln.strip().partition("=")
-                if k: cache[k] = v
-        except Exception: pass
+        cache = kv(cache_f)
+        disk = kv(disk_f)
         m = {
             "build_id": build_id,
             "repo": src_key,
@@ -470,6 +567,13 @@ phases:
             "tests_failed": summ.get("failed"),
             "tests_skipped": summ.get("skipped"),
             "test_total_ms": (summ.get("timing") or {}).get("test_total_ms"),
+            # Runner disk headroom (from the guard + post-run read). A build that
+            # ends near 0 free is the early warning for the next one's ENOSPC.
+            "disk_vol": disk.get("disk_vol"),
+            "disk_pct_start": num(disk.get("disk_pct_start")),
+            "disk_free_gb_start": num(disk.get("disk_free_gb_start")),
+            "disk_free_gb_end": num(disk.get("disk_free_gb_end")),
+            "disk_reclaimed_gb": num(disk.get("disk_reclaimed_gb")),
         }
         json.dump(m, open(out, "w"))
         print("=== METRICS " + json.dumps(m) + " ===")
