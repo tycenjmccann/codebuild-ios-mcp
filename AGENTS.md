@@ -8,13 +8,30 @@ detail lives in `README.md`; this file is the terse, do-this sequence.
 A CDK v2 (TypeScript) app that provisions an AWS CodeBuild **macOS (`MAC_ARM`)**
 iOS build+test runner and exposes it to agents as seven MCP tools through a
 Bedrock AgentCore Gateway: `ios_test`, `ios_build_status`, `list_schemes`,
-`get_test_logs`, `get_build_log`, `ios_cancel`. Async contract: `ios_test`
+`get_test_logs`, `get_build_log`, `ios_list_builds`, `ios_cancel`. Async contract: `ios_test`
 returns a `build_id`; poll `ios_build_status` until `status != "IN_PROGRESS"`
 (every status response carries a `phases[]` timeline). When a build fails before
 tests run (`BUILD_ERROR` / `test_summary.total == 0`), `get_build_log` surfaces
 the raw xcodebuild/clone/dep error that `get_test_logs` can't (it keys off named
 test failures); while a build runs it returns a live CloudWatch log tail.
 `ios_cancel` stops a runaway build (`StopBuild`).
+
+## Runner hardening (TEAM-4921 — already solved, don't reintroduce the bugs)
+
+- The buildspec's disk guard runs on every build, fails fast with
+  `runner disk full` when tiered reclaim isn't enough, and is never a no-op —
+  don't gate it behind `[ -d "$WARM_ROOT" ]` again.
+- The warm cache is never saved from a run that hit ENOSPC or produced no
+  `TestResults.xcresult` — the save gate and the disk guard are a matched
+  pair; if you touch one, check the other.
+- `ios_test`'s `branch` must be a branch/tag name or a **full 40-hex SHA** — an
+  abbreviated SHA fails CodeBuild's checkout, so the Lambda rejects it up
+  front (`reason: "SHORT_SHA"`) instead of burning a build slot.
+- `ios_test` can refuse with `reason: "INSUFFICIENT_CAPACITY"` when the target
+  fleet is not `ACTIVE` or looks stalled (`force: true` overrides); the
+  project has a `queuedTimeout` (default 60 min) so a wedged fleet fails a
+  queued build instead of hiding it for up to CodeBuild's 8h default. See
+  `docs/RUNBOOK-runner-disk-full.md`.
 
 ## Hard constraints (do not violate)
 
@@ -117,6 +134,9 @@ with its execution role's ambient creds. Just grant that role
 ## Verify
 
 ```bash
+# Lambda unit tests (stdlib unittest, no deps beyond boto3):
+python3 -m unittest discover -s lambda -p 'test_*.py' -v
+
 # Always synth before claiming a stack change works:
 npx cdk synth -c codebuild-ios-mcp:githubRepo=https://github.com/x/y -c codebuild-ios-mcp:projectDir=ios >/dev/null && echo OK
 

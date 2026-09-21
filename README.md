@@ -114,6 +114,8 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:projectDir`           | `.`                                                            | Subdir holding the `.xcworkspace`/`.xcodeproj`     |
 | `codebuild-ios-mcp:defaultDevice`        | `iPhone 17`                                                     | Default simulator device name                      |
 | `codebuild-ios-mcp:baseCapacity`         | `1`                                                            | Always-on reserved Macs = concurrent build slots (each ~$25-30/day; builds beyond it queue) |
+| `codebuild-ios-mcp:queuedTimeoutMinutes` | `60`                                                           | Max minutes a build may sit QUEUED before CodeBuild fails it (backstop for a wedged fleet; clamped 5-480) |
+| `codebuild-ios-mcp:fleetStallMinutes`    | `20`                                                           | QUEUED-with-nothing-running longer than this = `ios_test` treats the fleet as stalled (`INSUFFICIENT_CAPACITY`; `force:true` overrides) |
 | `codebuild-ios-mcp:artifactRetentionDays`| `14`                                                           | Days before `builds/` artifacts expire             |
 | `codebuild-ios-mcp:presignTtlSec`        | `3600`                                                         | TTL (seconds) for presigned artifact URLs          |
 | `codebuild-ios-mcp:vpcId`                | `""` (no VPC)                                                  | VPC to run builds in (reach private Nexus/services) |
@@ -171,20 +173,29 @@ KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregiste
 The Gateway exposes the seven tools defined in `gateway-tools.json`. The contract
 is async — start a build, then poll:
 
-1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session], [compute_size], [cache_save_threshold])`
+1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session], [compute_size], [cache_save_threshold], [force])`
    → returns `{ status: "IN_PROGRESS", build_id, repo, project_dir, branch, compute_size }`
    immediately (the resolved `repo`/`project_dir`/`branch` are echoed back so a
    wrong default is obvious). `repo`/`project_dir` point the shared project at
    another app for this run; `clean_build: true` forces a cold build (warm state
    untouched); `record_session: true` records the whole simulator display to a
    `session.mp4`; `compute_size: "large"` routes this run to the large (Apple M2,
-   12 vCPU/32 GB) fleet instead of medium.
+   12 vCPU/32 GB) fleet instead of medium. `branch` must be a branch/tag name or a
+   **full 40-hex commit SHA** — an abbreviated SHA is refused up front with
+   `reason: "SHORT_SHA"` (CodeBuild's checkout can't fetch one). Before starting,
+   the tool also refuses with `reason: "INSUFFICIENT_CAPACITY"` if the target
+   fleet is not `ACTIVE` or looks stalled (builds `QUEUED`, nothing running, past
+   `fleetStallMinutes`) — the response names the stalled build ids and a
+   remediation; pass `force: true` to enqueue anyway.
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
-   - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`).
+   - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`),
+     including a build no fleet instance ever picked up (`build_errors[0]` names the
+     QUEUED timeout — an infrastructure fault, not a test/compile failure).
    - `TIMED_OUT` — build exceeded the 40-minute limit.
-   - Every response carries `compute_size` (where it ran) and a `phases[]` timeline
+   - Every response carries `compute_size` (where it ran), `queued_seconds` (how
+     long it waited/waits for a fleet instance), and a `phases[]` timeline
      (DOWNLOAD_SOURCE → INSTALL → BUILD → … each with status + `duration_seconds`),
      so the agent can see *where* a slow build is and which phase failed — even
      while `IN_PROGRESS`.
@@ -209,9 +220,12 @@ is async — start a build, then poll:
    `ios_build_status` returns `BUILD_ERROR` or `test_summary.total == 0` —
    `get_test_logs` can't help there because there are no named tests.
 6. `ios_list_builds([limit], [compute_size])` — recent builds with status, phase,
-   size, and timing, plus running/queued counts. CodeBuild has no per-build
-   "which instance" view, so this is how an agent driving several builds sees
-   queue depth on each fleet instead of polling build ids blind.
+   size, timing, and `queued_seconds`, plus running/queued counts and a `fleets`
+   object keyed by size (`running`, `queued`, `oldest_queued_seconds`, `stalled`,
+   `queued_build_ids`, `fleet_status`). CodeBuild has no per-build "which
+   instance" view, so this is how an agent driving several builds sees queue
+   depth — and whether a fleet is actually wedged (`stalled: true`) — instead of
+   polling build ids blind.
 7. `ios_cancel(build_id)` — stop a wrong or runaway build (`StopBuild`) and free
    the macOS fleet instead of waiting out the 40-minute timeout.
 
@@ -408,6 +422,20 @@ Need a guaranteed cold build for one run? Pass **`clean_build: true`** to
 `ios_test` — it compiles into a fresh throwaway DerivedData for that run and
 leaves the warm state intact for the next. No redeploy.
 
+**Disk guard.** The reserved Mac's disk is the one thing that persists
+between builds, and it is finite: warm state, the SwiftPM cache, and scratch
+dirs from `clean_build` runs all accumulate. Every build now measures free
+disk on `$HOME` up front, reclaims in cheapest-first tiers (throwaway scratch
+→ SwiftPM/Xcode caches → least-recently-built warm state) if it's under
+threshold, and — if that still isn't enough — fails in seconds with a
+distinctive `runner disk full` error instead of ENOSPCing opaquely for
+minutes. A run that hit ENOSPC or produced no test result bundle never
+publishes its state as the warm cache, so a broken run can't poison the next
+one. `metrics.disk_free_gb_start`/`disk_free_gb_end`/`disk_reclaimed_gb` on
+`ios_build_status` show the headroom trend. See
+[`docs/RUNBOOK-runner-disk-full.md`](docs/RUNBOOK-runner-disk-full.md) if you
+hit this.
+
 ### Many apps on one stack
 
 The fleet is the only standing cost — **always run one shared fleet**, never one
@@ -472,6 +500,7 @@ aws codebuild delete-fleet --arn <FleetArn-from-outputs>
 ├── tooling/xcresult_to_junit.py     xcresult -> JUnit converter, uploaded to s3://<bucket>/tooling/
 ├── buildspec.yaml                   embedded inline into the CodeBuild project (single source of truth)
 ├── gateway-tools.json               inline tool schema for the Gateway lambda target
+├── docs/RUNBOOK-runner-disk-full.md runner disk-full / stalled-fleet operator steps
 ├── examples/connect_agent.py        SigV4 MCP client — connect an agent to the gateway
 ├── scripts/register-gateway.sh      one-time: create gateway + lambda target from stack outputs
 ├── scripts/deregister-gateway.sh    delete target(s) + gateway

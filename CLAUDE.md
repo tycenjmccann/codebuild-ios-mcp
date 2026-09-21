@@ -42,6 +42,14 @@ architecture, deploy steps, and cost warning.
   `Stack.of(this)`; IAM scopes to specific project, report-group, and bucket
   ARNs. Do not introduce `*` resources or hardcoded account ids.
 - **Do not use em dashes in AWS resource names** — use hyphens.
+- **The buildspec's disk guard and warm-cache save gate are a matched pair**
+  (TEAM-4921): the guard fails fast on a full runner, the save gate refuses to
+  publish state from a run that hit ENOSPC or produced no result bundle. Edit
+  them together. The Lambda's fleet capacity/stall preflight (`ios_test`,
+  `ios_list_builds`) depends on `codebuild:BatchGetFleets` being granted per
+  fleet ARN — if that grant is ever removed, the preflight degrades to
+  stall-detection-only rather than erroring. See
+  `docs/RUNBOOK-runner-disk-full.md`.
 
 ## Cost
 
