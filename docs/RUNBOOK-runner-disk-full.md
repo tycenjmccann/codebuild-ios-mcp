@@ -7,6 +7,21 @@ unchecked, the disk fills, every build step ENOSPCs, and the fleet can end up
 wedged with nothing running. This is what happened to build
 `ios-agent-tests:08d9c28a` (medium fleet, repo `tycenjmccann/talk-to-me`).
 
+Incident notes:
+
+- `ios-agent-tests:08d9c28a` — the original fill: ENOSPC on everything for ~6 min,
+  then the run published its own wreckage as the warm cache.
+- `ios-agent-tests:fd17a151` (2026-09-21, ~22:5x UTC) — a **fresh** medium
+  instance restored that poisoned cache and SwiftPM died on the half-written bare
+  repos inside the restored `SourcePackages`: repeated `error: packfile
+  .../SourcePackages/repositories/aws-sdk-swift-<hash>/objects/pack/pack-<id>.pack
+  does not match index`, then `fatal: update_ref failed ... nonexistent object`,
+  surfacing as `xcodebuild: error: Could not resolve package dependencies`. So a
+  poisoned restore is not just "cold" — its `SourcePackages` are corrupt, which is
+  why the build now discards them (below). Until that fix is deployed or the key
+  is deleted, `ios_test(clean_build: true)` bypasses the problem: a clean build
+  resolves into throwaway `/tmp` `SourcePackages` and never reads the poison.
+
 ## Symptoms
 
 - `build_output.log` / `error_tail.txt` contains `No space left on device`.
@@ -80,9 +95,13 @@ e.g. `https://github.com/tycenjmccann/talk-to-me.git` + `.` + `medium` →
 and `.hash` for the two objects under `warm-cache/`.
 
 After this fix, a poisoned restore (no `DerivedData/Build` in the tar) is
-detected and self-heals automatically — the next build reseeds S3 even at the
-same commit. Manual deletion is only needed for cache poisoned by an *older*
-buildspec, or if you want to force a clean reseed sooner than the next build.
+detected and self-heals automatically: the build **deletes the restored
+`SourcePackages` and `DerivedData`** — they are corrupt, not merely stale, and
+SwiftPM fails outright on them (`packfile ... does not match index`, see
+`fd17a151` above) — keeps `src/` as an rsync baseline, resolves and compiles
+cold, and reseeds S3 even at the same commit. Manual deletion is only needed for
+cache poisoned by an *older* build script, or to force a clean reseed sooner
+than the next build.
 
 ### 3. Recycle the fleet instance (only if the guard's own fail-fast keeps firing)
 

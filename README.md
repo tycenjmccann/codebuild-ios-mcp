@@ -433,7 +433,10 @@ threshold, and — if that still isn't enough — fails in seconds with a
 distinctive `runner disk full` error instead of ENOSPCing opaquely for
 minutes. A run that hit ENOSPC or produced no test result bundle never
 publishes its state as the warm cache, so a broken run can't poison the next
-one. `metrics.disk_free_gb_start`/`disk_free_gb_end`/`disk_reclaimed_gb` on
+one — and if an already-poisoned cache is restored (no `DerivedData/Build` in the
+tar), its `SourcePackages`/`DerivedData` are discarded before the build, because
+half-written SPM bare repos make `xcodebuild` fail outright rather than just
+compile cold. `metrics.disk_free_gb_start`/`disk_free_gb_end`/`disk_reclaimed_gb` on
 `ios_build_status` show the headroom trend. See
 [`docs/RUNBOOK-runner-disk-full.md`](docs/RUNBOOK-runner-disk-full.md) if you
 hit this.

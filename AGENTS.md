@@ -24,6 +24,10 @@ test failures); while a build runs it returns a live CloudWatch log tail.
 - The warm cache is never saved from a run that hit ENOSPC or produced no
   `TestResults.xcresult` — the save gate and the disk guard are a matched
   pair; if you touch one, check the other.
+- A restored cache with no `DerivedData/Build` is poisoned: the build deletes its
+  `SourcePackages` + `DerivedData` (keeping `src/`) and reseeds S3. Don't downgrade
+  that to a warning — corrupt SPM bare repos fail `xcodebuild` ("packfile ... does
+  not match index"), they don't just compile cold. Build `fd17a151` proved it.
 - `ios_test`'s `branch` must be a branch/tag name or a **full 40-hex SHA** — an
   abbreviated SHA fails CodeBuild's checkout, so the Lambda rejects it up
   front (`reason: "SHORT_SHA"`) instead of burning a build slot.

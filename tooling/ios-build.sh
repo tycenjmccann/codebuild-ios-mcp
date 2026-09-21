@@ -162,12 +162,22 @@ run() {
     fi
   fi
   # A tar with no DerivedData/Build is an empty/poisoned cache (a failed run
-  # published half-cloned SPM checkouts + empty DerivedData once). This run is
-  # cold anyway; POISONED forces a reseed, because the L1 hash gate would
-  # otherwise keep the poison in S3 forever at this commit.
+  # published half-cloned SPM checkouts + empty DerivedData once). Its
+  # SourcePackages are not merely stale, they are CORRUPT: build fd17a151
+  # restored them on a fresh instance and SwiftPM died with "packfile ... does
+  # not match index" / "update_ref failed ... nonexistent object" ->
+  # "Could not resolve package dependencies". So discard SourcePackages and the
+  # empty DerivedData outright (mkdir -p below recreates both); keep src/, which
+  # is still a useful rsync --checksum baseline. POISONED also forces a reseed,
+  # because the L1 hash gate would otherwise keep the poison in S3 forever at
+  # this commit.
   POISONED=0
   if [ -d "$REPO_STATE" ] && [ ! -d "$REPO_STATE/DerivedData/Build" ]; then
-    echo "WARNING: warm state for $SRC_KEY has no DerivedData/Build (empty or poisoned cache) -> cold compile; will reseed S3"
+    echo "WARNING: warm state for $SRC_KEY has no DerivedData/Build (empty or poisoned cache)"
+    echo "         -> discarding SourcePackages + DerivedData; cold resolve + compile; will reseed S3"
+    # Not on a clean build: that run uses throwaway /tmp DerivedData+SourcePackages
+    # and promises to leave warm state untouched. The next warm build discards it.
+    [ "$CLEAN_BUILD" != "true" ] && rm -rf "$REPO_STATE/SourcePackages" "$REPO_STATE/DerivedData" 2>/dev/null
     POISONED=1
   fi
   mark restored
