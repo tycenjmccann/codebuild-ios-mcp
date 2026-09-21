@@ -175,6 +175,15 @@ phases:
               echo "No warm cache in S3 yet (first build for this repo) -> cold compile expected"
             fi
           fi
+          # A tar with no DerivedData/Build is an empty/poisoned cache (a failed run
+          # published half-cloned SPM checkouts + empty DerivedData once). This run is
+          # cold anyway; POISONED forces a reseed, because the L1 hash gate would
+          # otherwise keep the poison in S3 forever at this commit.
+          POISONED=0
+          if [ -d "$REPO_STATE" ] && [ ! -d "$REPO_STATE/DerivedData/Build" ]; then
+            echo "WARNING: warm state for $SRC_KEY has no DerivedData/Build (empty or poisoned cache) -> cold compile; will reseed S3"
+            POISONED=1
+          fi
           mark restored
 
           # Save-gate L1: commit SHA (resolved > HEAD > shasum); same SHA at save => skip upload.
@@ -386,6 +395,24 @@ phases:
                && [ -n "${CACHE_SAVE_THRESHOLD:-}" ] && [ "$COMPILES" -lt "$CACHE_SAVE_THRESHOLD" ]; then
               SAVE=0; REASON="below threshold ($COMPILES<$CACHE_SAVE_THRESHOLD)"
             fi
+            # Layer 3: what we restored was empty/poisoned -> reseed even when the
+            # source hash matches, or the poison stays in S3 for good.
+            if [ "${POISONED:-0}" = "1" ]; then
+              SAVE=1; REASON="reseeding poisoned cache"
+            fi
+            # Layer 4 (poison veto, beats every layer above INCLUDING the seed): never
+            # publish state from a run that ran out of disk or never produced a result
+            # bundle. That is exactly what put a 4.2 GB tar of half-cloned SPM
+            # checkouts + empty DerivedData in S3 (TEAM-4921).
+            disk_read
+            if grep -qE 'No space left on device|out of space' "$LOG" 2>/dev/null; then
+              SAVE=0; REASON="run hit ENOSPC (refusing to publish broken state)"
+            elif [ ! -d "$CODEBUILD_SRC_DIR/TestResults.xcresult" ]; then
+              SAVE=0; REASON="no TestResults.xcresult (xcodebuild produced no result bundle)"
+            elif [ "$DISK_FREE_GB" -lt "$DISK_MIN_FREE_GB" ]; then
+              SAVE=0; REASON="only ${DISK_FREE_GB} GB free post-run (< ${DISK_MIN_FREE_GB})"
+            fi
+
             CACHE_SAVED=false
             if [ "$SAVE" = "1" ]; then
               echo "Saving warm cache -> $S3_CACHE ($REASON; $COMPILES recompiled)"
