@@ -33,6 +33,10 @@ new CodebuildIosMcpStack(app, 'CodebuildIosMcpStack', {
   githubRepo: ctx<string>('githubRepo', 'https://github.com/aws-samples/aws-mobile-ios-notes-tutorial'),
   sourceVersion: ctx<string>('sourceVersion', 'main'),
   projectDir: ctx<string>('projectDir', '.'),
+  // Name prefix the build role may read from Secrets Manager / SSM for
+  // build-time secret hydration (.codebuild/secrets.json). Scopes IAM so a repo
+  // reaches only its own secrets. Override: -c codebuild-ios-mcp:secretsPrefix=<prefix>.
+  secretsPrefix: ctx<string>('secretsPrefix', 'ios-ci/'),
   defaultDevice: ctx<string>('defaultDevice', 'iPhone 17'),
   // Concurrent build slots on the MEDIUM fleet = always-on reserved Macs. Each
   // bills ~$25-30/day whether idle or not. 1 = sequential (builds queue); raise

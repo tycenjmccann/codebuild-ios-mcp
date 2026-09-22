@@ -20,6 +20,13 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly sourceVersion: string;
   /** Subdir holding the .xcworkspace/.xcodeproj (maps to PROJECT_DIR). */
   readonly projectDir: string;
+  /**
+   * Name prefix the CodeBuild role may read from Secrets Manager and SSM
+   * Parameter Store for build-time secret hydration (.codebuild/secrets.json).
+   * Scopes least-privilege so a repo can only reach its own secrets. Example:
+   * "ios-ci/" lets the build read secretsmanager:ios-ci/* and ssm:/ios-ci/*.
+   */
+  readonly secretsPrefix: string;
   /** Default simulator device name (informational; ios_test can override). */
   readonly defaultDevice: string;
   /**
@@ -319,6 +326,37 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       }),
     );
     artifactsBucket.grantReadWrite(codeBuildRole);
+    // Build-time secret hydration (buildspec reads .codebuild/secrets.json and
+    // writes gitignored secret files before xcodebuild). Read-only, scoped to a
+    // per-project name prefix so repos can't reach unrelated secrets. Override
+    // the prefix via -c codebuild-ios-mcp:secretsPrefix=<prefix>.
+    codeBuildRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'HydrateSecrets',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          cdk.Stack.of(this).formatArn({
+            service: 'secretsmanager',
+            resource: 'secret',
+            resourceName: `${props.secretsPrefix}*`,
+            arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+    codeBuildRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'HydrateSsmParams',
+        actions: ['ssm:GetParameter'],
+        resources: [
+          cdk.Stack.of(this).formatArn({
+            service: 'ssm',
+            resource: 'parameter',
+            resourceName: `${props.secretsPrefix}*`,
+          }),
+        ],
+      }),
+    );
     codeBuildRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'CodeBuildReports',
