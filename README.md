@@ -116,7 +116,7 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:defaultDevice`        | `iPhone 17`                                                     | Default simulator device name                      |
 | `codebuild-ios-mcp:baseCapacity`         | `1`                                                            | Always-on reserved Macs = concurrent build slots (each ~$25-30/day; builds beyond it queue) |
 | `codebuild-ios-mcp:queuedTimeoutMinutes` | `60`                                                           | Max minutes a build may sit QUEUED before CodeBuild fails it (backstop for a wedged fleet; clamped 5-480) |
-| `codebuild-ios-mcp:fleetStallMinutes`    | `20`                                                           | QUEUED-with-nothing-running longer than this = `ios_test` treats the fleet as stalled (`INSUFFICIENT_CAPACITY`; `force:true` overrides) |
+| `codebuild-ios-mcp:fleetStallMinutes`    | `20`                                                           | QUEUED-with-nothing-running longer than this = `ios_test` treats the fleet as stalled (`INSUFFICIENT_CAPACITY`, with `stall_kind` `starved`\|`wedged`; `force:true` overrides) |
 | `codebuild-ios-mcp:artifactRetentionDays`| `14`                                                           | Days before `builds/` artifacts expire             |
 | `codebuild-ios-mcp:presignTtlSec`        | `3600`                                                         | TTL (seconds) for presigned artifact URLs          |
 | `codebuild-ios-mcp:vpcId`                | `""` (no VPC)                                                  | VPC to run builds in (reach private Nexus/services) |
@@ -187,13 +187,19 @@ is async — start a build, then poll:
    the tool also refuses with `reason: "INSUFFICIENT_CAPACITY"` if the target
    fleet is not `ACTIVE` or looks stalled (builds `QUEUED`, nothing running, past
    `fleetStallMinutes`) — the response names the stalled build ids and a
-   remediation; pass `force: true` to enqueue anyway.
+   remediation; pass `force: true` to enqueue anyway. A stall response also carries
+   `stall_kind`: `starved` (the fleet ran a build recently, so the instance is alive
+   and the scheduler skipped these builds — `ios_cancel` them and resubmit, free) or
+   `wedged` (nothing ran in a long time: disk full / unhealthy — recycle the
+   instance).
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
    - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`),
      including a build no fleet instance ever picked up (`build_errors[0]` names the
-     QUEUED timeout — an infrastructure fault, not a test/compile failure).
+     QUEUED timeout — an infrastructure fault, not a test/compile failure; resubmit
+     first, the build may simply have been starved, and only recycle the fleet if the
+     resubmit never starts either).
    - `TIMED_OUT` — build exceeded the 40-minute limit.
    - Every response carries `compute_size` (where it ran), `queued_seconds` (how
      long it waited/waits for a fleet instance), and a `phases[]` timeline
@@ -223,9 +229,10 @@ is async — start a build, then poll:
 6. `ios_list_builds([limit], [compute_size])` — recent builds with status, phase,
    size, timing, and `queued_seconds`, plus running/queued counts and a `fleets`
    object keyed by size (`running`, `queued`, `oldest_queued_seconds`, `stalled`,
-   `queued_build_ids`, `fleet_status`). CodeBuild has no per-build "which
-   instance" view, so this is how an agent driving several builds sees queue
-   depth — and whether a fleet is actually wedged (`stalled: true`) — instead of
+   `stall_kind`, `last_finished_seconds_ago`, `queued_build_ids`, `fleet_status`).
+   CodeBuild has no per-build "which instance" view, so this is how an agent driving
+   several builds sees queue depth — and whether a fleet is stalled
+   (`stalled: true`) and why (`stall_kind`: `starved` vs `wedged`) — instead of
    polling build ids blind.
 7. `ios_cancel(build_id)` — stop a wrong or runaway build (`StopBuild`) and free
    the macOS fleet instead of waiting out the 40-minute timeout.

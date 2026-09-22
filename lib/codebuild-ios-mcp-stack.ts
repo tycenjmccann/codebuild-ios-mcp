@@ -50,16 +50,18 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
    * is 8 hours, which hides a dead fleet from the agent entirely — the build just
    * never starts. One reserved Mac serializes builds at ~10-15 min each, so 60 min
    * is roughly a four-deep real queue; longer than that means no instance is
-   * picking work up. The Lambda's stall preflight catches the genuinely-wedged
-   * fleet far sooner (FLEET_STALL_MINUTES); this is the backstop. Clamped to
-   * CodeBuild's allowed 5-480 min.
+   * picking work up. The Lambda's stall preflight catches the stalled fleet — a
+   * starved build or a wedged instance — far sooner (FLEET_STALL_MINUTES); this is
+   * the backstop. Clamped to CodeBuild's allowed 5-480 min.
    */
   readonly queuedTimeoutMinutes: number;
   /**
    * How long a build may be QUEUED with NOTHING running on the same fleet before
    * ios_test treats that fleet as stalled and refuses to enqueue
    * (INSUFFICIENT_CAPACITY, overridable with force:true). Passed to the Lambda as
-   * FLEET_STALL_MINUTES.
+   * FLEET_STALL_MINUTES. Doubles as the "recently alive" window the Lambda uses to
+   * classify the stall as starved (cancel + resubmit) vs wedged (recycle), reported
+   * as stall_kind.
    */
   readonly fleetStallMinutes: number;
   /** Days before objects under builds/ expire in the artifacts bucket. */
@@ -418,9 +420,10 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       role: codeBuildRole,
       timeout: cdk.Duration.minutes(40),
       // Cap the QUEUED wait. Without this, CodeBuild's 8h default means a build no
-      // fleet instance can pick up (wedged/disk-full Mac) simply never starts, and
-      // the agent polls IN_PROGRESS forever. Failing it turns that into a
-      // BUILD_ERROR the Lambda labels as a queue timeout. See TEAM-4921.
+      // fleet instance picks up (wedged/disk-full Mac, or one the scheduler starved)
+      // simply never starts, and the agent polls IN_PROGRESS forever. Failing it
+      // turns that into a BUILD_ERROR the Lambda labels as a queue timeout. See
+      // TEAM-4921.
       queuedTimeout: cdk.Duration.minutes(props.queuedTimeoutMinutes),
       environment: {
         // The L2 rejects a Mac image at construct time ("Mac images must be used
@@ -473,7 +476,8 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         FLEET_MEDIUM_ARN: fleet.attrArn,
         FLEET_LARGE_ARN: fleetLarge ? fleetLarge.attrArn : '',
         // Stall threshold for the ios_test capacity preflight: QUEUED longer than
-        // this with nothing running on the same fleet = wedged instance, not a queue.
+        // this with nothing running on the same fleet = a stalled fleet (a starved
+        // build or a wedged instance, reported as stall_kind), not a deep queue.
         FLEET_STALL_MINUTES: String(props.fleetStallMinutes),
         // AWS_REGION is reserved/auto-populated by the Lambda runtime.
       },

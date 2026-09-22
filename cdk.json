@@ -31,7 +31,7 @@
     "codebuild-ios-mcp:presignTtlSec": 3600,
     "//queuedTimeoutMinutes": "Max minutes a build may sit QUEUED before CodeBuild fails it. CodeBuild's own default is 8h, which turns a wedged/disk-full Mac into a build that silently never starts. One reserved Mac serializes builds at ~10-15 min each, so 60 is about a four-deep real queue; raise it if you run deliberately deep queues. Allowed 5-480 (clamped).",
     "codebuild-ios-mcp:queuedTimeoutMinutes": 60,
-    "//fleetStallMinutes": "Minutes a build may be QUEUED with NOTHING running on the same fleet before ios_test calls that fleet stalled and refuses to enqueue (INSUFFICIENT_CAPACITY; force:true overrides). Read by the Lambda as FLEET_STALL_MINUTES.",
+    "//fleetStallMinutes": "Minutes a build may be QUEUED with NOTHING running on the same fleet before ios_test calls that fleet stalled and refuses to enqueue (INSUFFICIENT_CAPACITY; force:true overrides). Read by the Lambda as FLEET_STALL_MINUTES. A stall has two causes - a starved build (the instance is alive and ran something within this window; CodeBuild's scheduler just skipped the queued build) or a wedged instance (nothing ran in a long time: unhealthy / out of disk) - and the Lambda reports which as stall_kind, since only the second one justifies recycling the fleet.",
     "codebuild-ios-mcp:fleetStallMinutes": 20,
 
     "//vpc": "OPTIONAL — set these to run builds inside your VPC (reach private Nexus, internal validation services). Leave empty for no VPC. subnetIds/securityGroupIds are comma-separated.",

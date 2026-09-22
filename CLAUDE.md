@@ -57,7 +57,11 @@ architecture, deploy steps, and cost warning.
   them together. The Lambda's fleet capacity/stall preflight (`ios_test`,
   `ios_list_builds`) depends on `codebuild:BatchGetFleets` being granted per
   fleet ARN — if that grant is ever removed, the preflight degrades to
-  stall-detection-only rather than erroring. See
+  stall-detection-only rather than erroring. A stall is **not** always a wedged
+  instance (TEAM-4953): the preflight classifies it as `starved` vs `wedged` from
+  `last_finished_seconds_ago`, derived from the same `BatchGetBuilds` response (only
+  builds that got past `QUEUED` count — see `_ran_on_instance`), and the first
+  remediation for `starved` is `ios_cancel` + resubmit, not a recycle. See
   `docs/RUNBOOK-runner-disk-full.md`.
 
 ## Cost

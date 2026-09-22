@@ -1,4 +1,4 @@
-# Runbook: runner disk full / stalled fleet (TEAM-4921)
+# Runbook: runner disk full / stalled fleet (TEAM-4921, TEAM-4953)
 
 A reserved `MAC_ARM` instance has a persistent disk with several unbounded
 consumers: one warm-state tree per repo+subdir+size, the SwiftPM global cache,
@@ -21,6 +21,16 @@ Incident notes:
   why the build now discards them (below). Until that fix is deployed or the key
   is deleted, `ios_test(clean_build: true)` bypasses the problem: a clean build
   resolves into throwaway `/tmp` `SourcePackages` and never reads the poison.
+- `ios-agent-tests:a77946b2` (medium) and `bec57a76` (large), 2026-09-22 — **not a
+  disk problem at all.** `a77946b2` sat `QUEUED` 39 min while two *newer* medium
+  builds (e.g. `917d4503`, queued 91 s) were picked up and completed around it, and
+  the instance then idled ~8 min without taking it; `bec57a76` rode the same pattern
+  to the 52-min `queuedTimeout` and came back as `BUILD_ERROR`. `ios_cancel` plus the
+  same `ios_test` call again → `91cfdc39`, picked up in under 60 s with
+  `queued_seconds=0`. The `stalled: true` signal was correct (nothing was going to
+  pick that build up) but the old "wedged instance / recycle" diagnosis was wrong:
+  the instance was alive and had just finished builds. The build was **starved** by
+  CodeBuild's fleet scheduler, and the free fix is step 3 below.
 
 ## Symptoms
 
@@ -29,18 +39,34 @@ Incident notes:
   `ERROR: runner disk full ... - recycle the fleet instance`.
 - `ios_list_builds` shows `fleets.<size>.stalled: true` (builds `QUEUED`,
   nothing `running`, oldest queued past `FLEET_STALL_MINUTES`, default 20 min).
+  That means nothing is going to pick those builds up, from **two different
+  causes**, and `fleets.<size>.stall_kind` names which:
+  - `"starved"` — the instance is **alive**: `last_finished_seconds_ago` is inside
+    `FLEET_STALL_MINUTES`, i.e. the same fleet actually ran a build that recently, and
+    `builds[]` shows a `SUCCEEDED`/`FAILED`/`STOPPED` build of the same `compute_size`
+    with a recent end. CodeBuild's scheduler simply skipped the queued build. Go to
+    step 3 — it is free.
+  - `"wedged"` — nothing of that size has run in a long time
+    (`last_finished_seconds_ago` is null or older than `FLEET_STALL_MINUTES`): disk
+    full or unhealthy. That is the recycle case, step 4.
+  - Only a build that got *past* `QUEUED` counts as "the fleet ran something", so a
+    build you cancelled while it was still queued does not make a wedged fleet look
+    starved.
 - `ios_test` returns `reason: "INSUFFICIENT_CAPACITY"` — either the fleet is
-  not `ACTIVE`, or the queue looks stalled.
+  not `ACTIVE`, or the queue looks stalled. The stall response also carries
+  `stall_kind` and `last_finished_seconds_ago`, and its `remediation` string already
+  names the right fix for that cause.
 - `ios_build_status` returns `status: "BUILD_ERROR"` with a `build_errors[0]`
   starting `Timed out in QUEUED` — no instance ever picked the build up before
-  the project's `queuedTimeout` (default 60 min).
+  the project's `queuedTimeout` (default 60 min). Either cause can do this, so
+  resubmit (step 3) before recycling (step 4).
 - The build dies immediately with `ERROR: could not fetch
   s3://<bucket>/tooling/ios-build.sh` (followed by a `df -Pk` dump, in the
   CloudWatch log / `get_build_log` tail — no `build_output.log` is uploaded in
   this case). The buildspec is only a stub; the build body is fetched from S3.
   Two causes: the tooling was never deployed (run `cdk deploy`, which uploads
   `tooling/` via the BucketDeployment), or the runner is so full it cannot hold a
-  31 KB download — which is past what the in-script guard can fix, so go to step 3.
+  31 KB download — which is past what the in-script guard can fix, so go to step 4.
 
 ## What the guard now does
 
@@ -103,7 +129,36 @@ cold, and reseeds S3 even at the same commit. Manual deletion is only needed for
 cache poisoned by an *older* build script, or to force a clean reseed sooner
 than the next build.
 
-### 3. Recycle the fleet instance (only if the guard's own fail-fast keeps firing)
+### 3. Starved `QUEUED` build → `ios_cancel` the build(s) and resubmit with `ios_test`
+
+The cheapest remediation on this page, and the right one whenever the instance is
+still alive. **How to identify it:** a build sits `QUEUED` past
+`FLEET_STALL_MINUTES` while *newer* builds on the same fleet were picked up and
+completed, or the instance is demonstrably idle and simply isn't taking it —
+`fleets.<size>.stall_kind` reads `"starved"` and
+`fleets.<size>.last_finished_seconds_ago` is small. CodeBuild's fleet scheduler
+skipped the build; nothing is wrong with the Mac.
+
+The exact calls — cancel every id in `fleets.<size>.queued_build_ids` (the same ids
+appear as `stalled_builds` in the `INSUFFICIENT_CAPACITY` refusal), then re-issue the
+**same** `ios_test` call that produced the starved build:
+
+```text
+ios_cancel(build_id: "ios-agent-tests:a77946b2")
+ios_test(branch: "...", scheme: "...", ...)   # identical arguments
+```
+
+Expected outcome: the resubmitted build is picked up in **under 60 s** with
+`queued_seconds` ≈ 0 (this is exactly what `91cfdc39` did). The cancel is needed
+first because the starved builds keep the fleet looking stalled and the preflight
+will refuse the resubmit otherwise.
+
+This costs **nothing** — no fleet recycle, no `cdk deploy`, no new ~24h lease, no
+warm state lost. Escalate to step 4 only when **nothing** on that fleet has run in
+more than `FLEET_STALL_MINUTES` (`stall_kind: "wedged"`) **and** a resubmitted build
+also stalls.
+
+### 4. Recycle the fleet instance (only if the guard's own fail-fast keeps firing)
 
 There is **no documented per-instance reboot API for reserved `MAC_ARM`
 fleets** — don't invent one. Two real options, in order of preference:
@@ -115,7 +170,7 @@ fleets** — don't invent one. Two real options, in order of preference:
   a new ~24h minimum lease (cost) and requires `cdk deploy` — **the human
   operator's step, never run by an agent.**
 
-### 4. Post-deploy check: is `BatchGetFleets` actually readable?
+### 5. Post-deploy check: is `BatchGetFleets` actually readable?
 
 The Lambda's capacity preflight needs `codebuild:BatchGetFleets` on the fleet
 ARNs (granted in `lib/codebuild-ios-mcp-stack.ts`). If that action turns out
@@ -135,6 +190,8 @@ aws lambda invoke --function-name codebuild-ios-mcp \
 
 Every fix above is free to *apply* (buildspec/Lambda/CDK changes cost nothing
 until deployed), but recreating a fleet always restarts the ~24h minimum
-lease at ~$25-30/day/instance. Prefer step 1, then step 2, before reaching for
-step 3. **Only the human operator runs `cdk deploy`** — an agent proposing
-this runbook's steps should stop short of deploying and hand the command back.
+lease at ~$25-30/day/instance. Steps 1, 2 and 3 are all free — work through them in
+order (re-run, then poisoned-cache delete, then cancel + resubmit for a starved
+build) before reaching for step 4. **Only the human operator runs `cdk deploy`** —
+an agent proposing this runbook's steps should stop short of deploying and hand the
+command back.
