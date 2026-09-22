@@ -34,7 +34,12 @@ test failures); while a build runs it returns a live CloudWatch log tail.
 - `ios_test` can refuse with `reason: "INSUFFICIENT_CAPACITY"` when the target
   fleet is not `ACTIVE` or looks stalled (`force: true` overrides); the
   project has a `queuedTimeout` (default 60 min) so a wedged fleet fails a
-  queued build instead of hiding it for up to CodeBuild's 8h default. See
+  queued build instead of hiding it for up to CodeBuild's 8h default. A stall has
+  **two** causes and `stall_kind` says which: `starved` (the fleet ran a build within
+  `FLEET_STALL_MINUTES`, so the instance is alive and CodeBuild's scheduler skipped
+  the queued build — `ios_cancel` it and resubmit the same `ios_test`, which costs
+  nothing) or `wedged` (nothing ran in a long time: disk full / unhealthy). Never
+  propose recycling a fleet before a resubmit has also stalled. See
   `docs/RUNBOOK-runner-disk-full.md`.
 
 ## Hard constraints (do not violate)

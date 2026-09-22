@@ -28,10 +28,14 @@ PRESIGN_TTL = int(os.environ.get("PRESIGN_TTL_SEC", "3600"))
 # large fleet is not enabled in the stack.
 FLEET_MEDIUM_ARN = os.environ.get("FLEET_MEDIUM_ARN", "")
 FLEET_LARGE_ARN = os.environ.get("FLEET_LARGE_ARN", "")
-# A build queued longer than this with NOTHING running on the same fleet means the
-# instance is wedged (unhealthy / out of disk), not that the queue is deep: one
-# reserved Mac finishes a build in ~10-15 min, so nothing should wait 20 min behind
-# an idle fleet. Used by the ios_test preflight and the ios_list_builds fleet view.
+# A build queued longer than this with NOTHING running on the same fleet is not a
+# deep queue: one reserved Mac finishes a build in ~10-15 min, so nothing should
+# wait 20 min behind an idle fleet. Two causes, told apart by
+# last_finished_seconds_ago: the build was STARVED (the fleet actually ran a build
+# within this window, so the instance is alive and CodeBuild's scheduler simply
+# skipped the queued build - cancel + resubmit, free) or the instance is WEDGED
+# (nothing ran in a long time: unhealthy / out of disk - recycle it). Used by the
+# ios_test preflight and the ios_list_builds fleet view. See TEAM-4953.
 FLEET_STALL_MINUTES = int(os.environ.get("FLEET_STALL_MINUTES", "20"))
 
 codebuild = boto3.client("codebuild", region_name=REGION)
@@ -122,7 +126,7 @@ def ios_test(args: dict) -> dict:
     # Swift's incremental validity check -> full recompile + mutual clobber.
     env.append({"name": "COMPUTE_SIZE", "value": size, "type": "PLAINTEXT"})
 
-    # Capacity preflight. A non-ACTIVE or wedged fleet still ACCEPTS StartBuild and
+    # Capacity preflight. A non-ACTIVE or stalled fleet still ACCEPTS StartBuild and
     # then never runs it, so the agent gets a build_id it can poll for hours
     # (TEAM-4921 left running:0 queued:3). Refuse up front instead, and say what to
     # do about it. force=true enqueues anyway; the check is best-effort and never
@@ -173,7 +177,8 @@ def ios_build_status(args: dict) -> dict:
                 "current_phase": build.get("currentPhase", ""),
                 # How long this build has waited for a fleet instance. Still rising
                 # while current_phase is QUEUED; a value climbing past a few minutes
-                # with no other build running means the fleet is wedged, not busy.
+                # with no other build running means the fleet is stalled, not busy —
+                # ios_list_builds' fleets.<size>.stall_kind says starved vs wedged.
                 "queued_seconds": _queued_seconds(build),
                 "phases": phases}
 
@@ -216,9 +221,13 @@ def ios_build_status(args: dict) -> dict:
         build_errors.insert(
             0,
             f"Timed out in QUEUED after {_queued_seconds(build) // 60} min: no fleet "
-            "instance picked the build up (fleet unhealthy / disk full). Recycle the "
-            "fleet instance - see docs/RUNBOOK-runner-disk-full.md. ios_list_builds "
-            "shows the fleet's queue state.",
+            "instance picked the build up. Resubmit with ios_test first - the build may "
+            "simply have been starved (the scheduler skipped it while the instance was "
+            "alive), and a resubmit is normally picked up within a minute. Only if the "
+            "resubmit also never starts is the instance wedged (unhealthy / disk full) "
+            "and in need of recycling - see docs/RUNBOOK-runner-disk-full.md. "
+            "ios_list_builds shows the fleet's queue state, including "
+            "fleets.<size>.stall_kind.",
         )
 
     return {
@@ -548,14 +557,36 @@ def _queued_seconds(build: dict) -> int:
     return 0
 
 
+def _ran_on_instance(build: dict) -> bool:
+    """True when a build actually left QUEUED and executed on a fleet instance.
+
+    An `endTime` alone does NOT prove the Mac was alive: a build cancelled with
+    ios_cancel, or killed by queuedTimeout, ends while still QUEUED and never
+    touches the instance. Counting those as "the fleet finished work recently"
+    would relabel a genuinely wedged fleet as merely starved right after an
+    operator cancels the stalled builds — exactly when the diagnosis matters. Any
+    phase past SUBMITTED/QUEUED means CodeBuild handed the build to an instance.
+    """
+    for p in build.get("phases", []):
+        if p.get("phaseType") not in ("SUBMITTED", "QUEUED"):
+            return True
+    return False
+
+
 def _queue_snapshot(builds=None) -> dict:
     """Per-size queue state: running, queued, oldest_queued_seconds, stalled,
-    queued_build_ids.
+    stall_kind, last_finished_seconds_ago, queued_build_ids.
 
     `stalled` = builds are QUEUED, NOTHING is running on that size, and the oldest
-    has waited longer than FLEET_STALL_MINUTES — i.e. the fleet instance is wedged
-    rather than busy. Pass an already-fetched build list to skip a second
-    ListBuildsForProject + BatchGetBuilds round trip; shared by the ios_test
+    has waited longer than FLEET_STALL_MINUTES — i.e. nothing is going to pick these
+    builds up. `stall_kind` says why: "starved" when the fleet demonstrably RAN a
+    build within FLEET_STALL_MINUTES (instance alive, CodeBuild's scheduler skipped
+    the queued build — cancel + resubmit fixes it), else "wedged" (unhealthy / out of
+    disk — recycle it); None when not stalled. `last_finished_seconds_ago` is the age
+    of the most recent finished build of that size and counts only builds that got
+    past QUEUED (see _ran_on_instance) — a build cancelled or timed out while still
+    QUEUED proves nothing about the Mac. Pass an already-fetched build list to skip a
+    second ListBuildsForProject + BatchGetBuilds round trip; shared by the ios_test
     preflight and the ios_list_builds fleet view.
     """
     snap = {}
@@ -563,13 +594,24 @@ def _queue_snapshot(builds=None) -> dict:
         if size == "large" and not FLEET_LARGE_ARN:
             continue    # not deployed; don't report a fleet that doesn't exist
         snap[size] = {"running": 0, "queued": 0, "oldest_queued_seconds": 0,
-                      "stalled": False, "queued_build_ids": []}
+                      "stalled": False, "stall_kind": None,
+                      "last_finished_seconds_ago": None, "queued_build_ids": []}
     if builds is None:
         ids = codebuild.list_builds_for_project(projectName=PROJECT).get("ids", [])[:50]
         builds = codebuild.batch_get_builds(ids=ids).get("builds", []) if ids else []
     for b in builds:
         entry = snap.get(_compute_size(b))
-        if entry is None or b.get("buildStatus") != "IN_PROGRESS":
+        if entry is None:
+            continue
+        if b.get("buildStatus") != "IN_PROGRESS":
+            # The most recent build that actually RAN on this size is proof the
+            # instance was alive that recently — the whole starved-vs-wedged signal,
+            # read off the BatchGetBuilds response we already have (no extra call).
+            end = b.get("endTime")
+            if end and _ran_on_instance(b):
+                ago = max(0, int(datetime.now(timezone.utc).timestamp() - end.timestamp()))
+                prev = entry["last_finished_seconds_ago"]
+                entry["last_finished_seconds_ago"] = ago if prev is None else min(prev, ago)
             continue
         if b.get("currentPhase") == "QUEUED":
             entry["queued"] += 1
@@ -581,6 +623,11 @@ def _queue_snapshot(builds=None) -> dict:
     for entry in snap.values():
         entry["stalled"] = (entry["queued"] > 0 and entry["running"] == 0
                             and entry["oldest_queued_seconds"] > FLEET_STALL_MINUTES * 60)
+        last = entry["last_finished_seconds_ago"]
+        entry["stall_kind"] = (None if not entry["stalled"] else
+                               "starved" if last is not None
+                               and last <= FLEET_STALL_MINUTES * 60
+                               else "wedged")
     return snap
 
 
@@ -643,6 +690,30 @@ def _capacity_preflight(size: str):
         print(f"queue stall check skipped: {type(e).__name__}: {e}")
         return None
     if queue.get("stalled"):
+        # Same refusal either way — the build would never start — but the CAUSE decides
+        # the fix, and they cost wildly different amounts. starved: the Mac is alive
+        # (it ran a build within FLEET_STALL_MINUTES) and the scheduler skipped these
+        # builds, so cancel + resubmit, free. wedged: nothing has run in a long time,
+        # so the instance needs recycling (new ~24h lease, human-run cdk deploy).
+        last = queue.get("last_finished_seconds_ago")
+        starved = queue.get("stall_kind") == "starved"
+        preamble = (f"The {size} fleet looks stalled: {queue['queued']} build(s) QUEUED, "
+                    f"none running, oldest waiting {queue['oldest_queued_seconds'] // 60} min "
+                    f"(> {FLEET_STALL_MINUTES} min). ")
+        if starved:
+            detail = (f"The fleet finished a build {(last or 0) // 60} min ago, so the instance "
+                      "is alive: CodeBuild's scheduler skipped the queued build(s) (starved), "
+                      "and this build would queue behind them indefinitely.")
+            remediation = ("Cancel the starved build(s) with ios_cancel and resubmit with "
+                           "ios_test - they are normally picked up within a minute. Recycle the "
+                           "instance only if a resubmitted build also stalls - see "
+                           "docs/RUNBOOK-runner-disk-full.md. Pass force=true to enqueue anyway.")
+        else:
+            detail = ("The instance is wedged (unhealthy or out of disk), so this build would "
+                      "queue behind them indefinitely.")
+            remediation = ("Inspect the stalled builds with get_build_log, cancel them with "
+                           "ios_cancel, and recycle the fleet instance - see "
+                           "docs/RUNBOOK-runner-disk-full.md. Pass force=true to enqueue anyway.")
         return {
             "status": "ERROR",
             "reason": "INSUFFICIENT_CAPACITY",
@@ -650,13 +721,10 @@ def _capacity_preflight(size: str):
             "fleet_status": "ACTIVE",
             "stalled_builds": queue.get("queued_build_ids", []),
             "oldest_queued_seconds": queue.get("oldest_queued_seconds", 0),
-            "message": f"The {size} fleet looks stalled: {queue['queued']} build(s) QUEUED, "
-                       f"none running, oldest waiting {queue['oldest_queued_seconds'] // 60} min "
-                       f"(> {FLEET_STALL_MINUTES} min). The instance is wedged (unhealthy or out "
-                       "of disk), so this build would queue behind them indefinitely.",
-            "remediation": "Inspect the stalled builds with get_build_log, cancel them with "
-                           "ios_cancel, and recycle the fleet instance - see "
-                           "docs/RUNBOOK-runner-disk-full.md. Pass force=true to enqueue anyway.",
+            "stall_kind": queue.get("stall_kind"),
+            "last_finished_seconds_ago": last,
+            "message": preamble + detail,
+            "remediation": remediation,
         }
     return None
 
