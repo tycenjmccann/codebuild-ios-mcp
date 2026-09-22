@@ -36,6 +36,37 @@ def queued_build(build_id, minutes_queued, size="BUILD_GENERAL1_MEDIUM"):
     }
 
 
+def finished_build(build_id, minutes_ago, size="BUILD_GENERAL1_MEDIUM",
+                   status="SUCCEEDED", ran=True):
+    """A build that ENDED `minutes_ago` on `size`.
+
+    `ran=True` (default) gives it phases past QUEUED — proof the fleet instance was
+    alive that recently. `ran=False` gives it SUBMITTED+QUEUED only, i.e. a build
+    cancelled or timed out while still QUEUED, which never touched the Mac.
+    """
+    end = NOW - datetime.timedelta(minutes=minutes_ago)
+    phases = [
+        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "durationInSeconds": 0},
+        {"phaseType": "QUEUED", "phaseStatus": "SUCCEEDED", "durationInSeconds": 30,
+         "endTime": end - datetime.timedelta(minutes=11)},
+    ]
+    if ran:
+        phases += [
+            {"phaseType": "PROVISIONING", "phaseStatus": "SUCCEEDED", "durationInSeconds": 20},
+            {"phaseType": "BUILD", "phaseStatus": "SUCCEEDED", "durationInSeconds": 600},
+            {"phaseType": "COMPLETED"},
+        ]
+    return {
+        "id": build_id,
+        "buildStatus": status,
+        "currentPhase": "COMPLETED",
+        "environment": {"computeType": size},
+        "startTime": end - datetime.timedelta(minutes=12),
+        "endTime": end,
+        "phases": phases,
+    }
+
+
 class NoSuchKey(Exception):
     pass
 
@@ -150,6 +181,92 @@ class IosTestCapacityPreflight(unittest.TestCase):
         h.codebuild.start_build.assert_called_once()
 
 
+class StallKindClassification(unittest.TestCase):
+    """TEAM-4953: a stall is either a starved build (instance alive, scheduler
+    skipped it — cancel + resubmit) or a wedged instance (recycle)."""
+
+    def setUp(self):
+        h.codebuild = MagicMock()
+        h.FLEET_MEDIUM_ARN = "arn:aws:codebuild:us-east-1:1:fleet/med"
+        h.FLEET_LARGE_ARN = ""
+        h.FLEET_STALL_MINUTES = 20
+        h.codebuild.batch_get_fleets.return_value = {
+            "fleets": [{"status": {"statusCode": "ACTIVE"}}]
+        }
+
+    def _ios_test_with(self, builds):
+        h.codebuild.list_builds_for_project.return_value = {
+            "ids": [b["id"] for b in builds]
+        }
+        h.codebuild.batch_get_builds.return_value = {"builds": builds}
+        return h.ios_test({"branch": "main", "scheme": "X"})
+
+    def test_starved_stall_recommends_cancel_and_resubmit(self):
+        result = self._ios_test_with([queued_build("a", 45), finished_build("z", 5)])
+        self.assertEqual(result["reason"], "INSUFFICIENT_CAPACITY")
+        self.assertEqual(result["stall_kind"], "starved")
+        self.assertAlmostEqual(result["last_finished_seconds_ago"], 300, delta=5)
+        self.assertTrue(result["remediation"].startswith(
+            "Cancel the starved build(s) with ios_cancel"))
+        self.assertIn("resubmit with ios_test", result["remediation"])
+        # The expensive fix must not be the lead: no bare "recycle the fleet instance".
+        self.assertNotIn("recycle the fleet instance", result["remediation"])
+        self.assertIn("starved", result["message"])
+        self.assertIn("the instance is alive", result["message"])
+        h.codebuild.start_build.assert_not_called()
+
+    def test_wedged_stall_keeps_recycle_wording(self):
+        result = self._ios_test_with([queued_build("a", 45)])
+        self.assertEqual(result["reason"], "INSUFFICIENT_CAPACITY")
+        self.assertEqual(result["stall_kind"], "wedged")
+        self.assertIsNone(result["last_finished_seconds_ago"])
+        self.assertIn("The instance is wedged (unhealthy or out of disk)", result["message"])
+        self.assertIn("recycle the fleet instance", result["remediation"])
+        h.codebuild.start_build.assert_not_called()
+
+    def test_old_finished_build_is_still_wedged(self):
+        result = self._ios_test_with([queued_build("a", 45), finished_build("z", 45)])
+        self.assertEqual(result["stall_kind"], "wedged")
+        self.assertIn("recycle the fleet instance", result["remediation"])
+
+    def test_build_cancelled_in_queued_does_not_prove_instance_alive(self):
+        # An operator cancelling a stalled build leaves a STOPPED build with a fresh
+        # endTime that never ran on the Mac. It must not relabel the fleet "starved".
+        cancelled = finished_build("z", 2, status="STOPPED", ran=False)
+        snap = h._queue_snapshot([queued_build("a", 45), cancelled])
+        self.assertIsNone(snap["medium"]["last_finished_seconds_ago"])
+        self.assertEqual(snap["medium"]["stall_kind"], "wedged")
+
+    def test_not_stalled_has_null_stall_kind(self):
+        snap = h._queue_snapshot([queued_build("a", 5), finished_build("z", 5)])
+        self.assertFalse(snap["medium"]["stalled"])
+        self.assertIsNone(snap["medium"]["stall_kind"])
+
+    def test_other_size_finished_build_does_not_count(self):
+        h.FLEET_LARGE_ARN = "arn:aws:codebuild:us-east-1:1:fleet/lrg"
+        snap = h._queue_snapshot([
+            queued_build("a", 45),
+            finished_build("z", 5, size="BUILD_GENERAL1_LARGE"),
+        ])
+        self.assertIsNone(snap["medium"]["last_finished_seconds_ago"])
+        self.assertEqual(snap["medium"]["stall_kind"], "wedged")
+        self.assertAlmostEqual(snap["large"]["last_finished_seconds_ago"], 300, delta=5)
+
+    def test_ios_list_builds_exposes_stall_fields(self):
+        builds = [queued_build("a", 45), finished_build("z", 5)]
+        h.codebuild.list_builds_for_project.return_value = {
+            "ids": [b["id"] for b in builds]
+        }
+        h.codebuild.batch_get_builds.return_value = {"builds": builds}
+        medium = h.ios_list_builds({})["fleets"]["medium"]
+        self.assertEqual(medium["stall_kind"], "starved")
+        self.assertAlmostEqual(medium["last_finished_seconds_ago"], 300, delta=5)
+        # existing fields keep their meaning
+        self.assertTrue(medium["stalled"])
+        self.assertEqual(medium["queued_build_ids"], ["a"])
+        self.assertEqual(medium["fleet_status"], "ACTIVE")
+
+
 class QueuedTimeoutMapping(unittest.TestCase):
     def setUp(self):
         h.codebuild = MagicMock()
@@ -179,7 +296,12 @@ class QueuedTimeoutMapping(unittest.TestCase):
         result = h.ios_build_status({"build_id": "p:5"})
         self.assertEqual(result["status"], "BUILD_ERROR")
         self.assertEqual(result["queued_seconds"], 3600)
-        self.assertIn("Timed out in QUEUED", result["build_errors"][0])
+        first = result["build_errors"][0]
+        self.assertIn("Timed out in QUEUED", first)
+        # Cheap path first: resubmit (it may have been starved) before recycling.
+        self.assertIn("Resubmit with ios_test", first)
+        self.assertIn("docs/RUNBOOK-runner-disk-full.md", first)
+        self.assertLess(first.index("Resubmit with ios_test"), first.index("recycling"))
 
     def test_normal_failure_is_not_relabeled(self):
         build = {
