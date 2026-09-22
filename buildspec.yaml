@@ -3,8 +3,16 @@
 # SCHEME / DEVICE / OS_VERSION / TEST_PLAN / PROJECT_DIR via
 # environmentVariablesOverride; ARTIFACTS_BUCKET is set on the project.
 #
-# Each CodeBuild command runs in its own shell with a fresh CWD, so the whole
-# run is ONE block to keep state (cd, vars) intact.
+# This file is the STUB + environment only. The build body (~31 KB of shell)
+# lives in tooling/ios-build.sh and is fetched from S3 at build time, because
+# CodeBuild caps an INLINE buildspec at 25600 bytes - a cap we hit for real on
+# the live project (a4bc8ef "25550B < 25600B cap"). The stack asserts the cap at
+# synth time. Both files ship in the same `cdk deploy`: this one is embedded
+# inline into the project, tooling/ios-build.sh is uploaded to
+# s3://<bucket>/tooling/ by the ToolingDeployment BucketDeployment.
+#
+# Each CodeBuild command runs in its own shell with a fresh CWD, so the body is
+# ONE script (state: cd, vars) invoked from ONE command here.
 version: 0.2
 
 env:
@@ -14,6 +22,8 @@ env:
     OS_VERSION: "latest"
     TEST_PLAN: ""
     PROJECT_DIR: "."    # subdir holding the .xcworkspace/.xcodeproj (e.g. "ios")
+    PLATFORM: "auto"    # auto|ios|macos — auto picks iOS Simulator if the scheme has
+                        # one, else native macOS (SwiftUI/AppKit Mac apps). ios_test override.
     CLEAN_BUILD: ""     # "true" (per-call ios_test arg) forces a cold build; warm state untouched
     RECORD_SESSION: ""  # "true" (per-call ios_test arg) records the whole simulator display to session.mp4
     COMPUTE_SIZE: "medium"  # fleet size this run lands on; scopes the S3 warm cache key so
@@ -25,392 +35,20 @@ phases:
   build:
     commands:
       - |
-        # No global `set -e`: scheme/device probing (ls, grep) returns nonzero on
-        # "no match" and would abort before xcodebuild; we capture the test exit
-        # code explicitly. ALL output is tee'd to build_output.log, which + an
-        # error_tail.txt ALWAYS upload to builds/<id>/ even on pre-test failure --
-        # the contract get_build_log reads.
-        LOG="$CODEBUILD_SRC_DIR/build_output.log"
-
-        # run() is piped to tee; recover its exit via PIPESTATUS, use `return` not
-        # `exit` so diagnostics upload. run()'s subshell vars don't survive to the
-        # metrics block, so mark <name> stamps "<name> <epoch>" to a file to diff.
-        PHASES="$CODEBUILD_SRC_DIR/phase_times.txt"; : > "$PHASES"
-        mark() { echo "$1 $(date +%s)" >> "$PHASES"; }
-
-        run() {
-          mark start
-          BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF:-${CODEBUILD_SOURCE_VERSION:-main}}"
-          BRANCH="${BRANCH##refs/heads/}"
-
-          # --- stable, per-repo warm state (instance-local + S3-backed) ----------
-          # 1) CodeBuild checks out to a NEW /tmp/codebuild-<uuid>/ each run; Swift
-          #    bakes the absolute working-dir into incremental state, so a moving src
-          #    = full recompile. Fix: mirror to a STABLE path ($HOME=/Users/cbuser,
-          #    identical fleet-wide) and build there.
-          # 2) Reserved fleets have no build-to-instance affinity; a repo is warm only
-          #    on the Mac it last ran on. Fix: back warm state with S3, restore on a
-          #    cold instance. Key is per-repo+size so apps/fleets don't contaminate.
-          WARM_ROOT="$HOME/ios-mcp-state"   # build-user owned; survives on the instance
-          # SRC_KEY is scoped by repo + subdir + COMPUTE_SIZE. Size matters because
-          # medium and large are SEPARATE fleets: a large Mac restoring medium's tar
-          # (or vice versa) fails Swift's incremental validity check -> full recompile,
-          # then re-saves its own -> the two sizes endlessly clobber a shared key.
-          # Size in the key gives each fleet its own consistent cache; cross-instance
-          # warm then works reliably within a size (proven: medium->medium = 65 compiles).
-          SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_' )
-          REPO_STATE="$WARM_ROOT/$SRC_KEY"
-          STABLE_SRC="$REPO_STATE/src"
-          S3_CACHE="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.tar.gz"
-
-          # Restore from S3 only when this instance is cold for this repo (no local
-          # DerivedData) and not a forced clean build. Streamed tar + gzip -1: no
-          # temp-disk doubling. S3_HAD_CACHE gates the save: seed once if S3 is empty
-          # even when warm-local, else a sibling Mac has nothing to restore.
-          S3_HAD_CACHE=0
-          aws s3 ls "$S3_CACHE" >/dev/null 2>&1 && S3_HAD_CACHE=1
-          if [ "$CLEAN_BUILD" != "true" ] && [ ! -d "$REPO_STATE/DerivedData" ]; then
-            echo "Cold instance for $SRC_KEY -> restoring warm cache from $S3_CACHE"
-            mkdir -p "$WARM_ROOT"
-            T0=$(date +%s)
-            if [ "$S3_HAD_CACHE" = "1" ] && aws s3 cp "$S3_CACHE" - 2>/dev/null | gzip -d 2>/dev/null | tar -x -C "$WARM_ROOT" 2>/dev/null; then
-              echo "Warm cache restored in $(( $(date +%s) - T0 ))s"
-            else
-              echo "No warm cache in S3 yet (first build for this repo) -> cold compile expected"
-            fi
-          fi
-          mark restored
-
-          # Source identity (Layer 1 of the save gate). The build is a checkout at a
-          # known git commit, so the commit SHA fully identifies the source — far more
-          # stable than hashing the filesystem (which churns: SPM rewrites
-          # Package.resolved, generated files land in the tree, mtimes shift), which is
-          # why an earlier file-glob hash drifted between two identical-source runs and
-          # the skip never fired. Prefer CodeBuild's resolved commit; fall back to the
-          # git HEAD of the mirrored .git, then to a sorted source shasum for non-git
-          # sources. At save time we compare to the value stored beside the S3 tar:
-          # same SHA => source unchanged => skip the ~160-200s re-upload.
-          S3_HASH="s3://$ARTIFACTS_BUCKET/warm-cache/$SRC_KEY.hash"
-          SRC_HASH="${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"
-          if [ -z "$SRC_HASH" ]; then
-            SRC_HASH=$(git -C "$STABLE_SRC" rev-parse HEAD 2>/dev/null || echo "")
-          fi
-          if [ -z "$SRC_HASH" ]; then
-            SRC_HASH=$(cd "$STABLE_SRC" && find . -type f \
-              \( -name '*.swift' -o -name '*.h' -o -name '*.m' -o -name '*.mm' \
-                 -o -name '*.c' -o -name '*.cpp' -o -name 'Package.resolved' \
-                 -o -name '*.pbxproj' \) ! -path '*/DerivedSources/*' -print0 2>/dev/null \
-              | sort -z | xargs -0 shasum 2>/dev/null | shasum | awk '{print $1}')
-          fi
-          echo "Source hash: $SRC_HASH"
-          STORED_HASH=$(aws s3 cp "$S3_HASH" - 2>/dev/null || echo "")
-
-          mkdir -p "$STABLE_SRC"
-          # rsync --checksum preserves mtimes of unchanged files (a fresh checkout
-          # restamps every mtime, which would re-dirty everything); only genuinely
-          # changed files copy -> only those recompile. Mirrored after restore so the
-          # checkout wins. .git included: SPM/Run Script version-stamping needs it.
-          echo "Mirroring source -> $STABLE_SRC (stable path for warm incremental)"
-          rsync -a --checksum --delete "$CODEBUILD_SRC_DIR/" "$STABLE_SRC/"
-          mark mirrored
-          cd "$STABLE_SRC/$PROJECT_DIR" || { echo "ERROR: PROJECT_DIR '$PROJECT_DIR' not found under $STABLE_SRC"; return 1; }
-
-          # --- pick container: workspace beats project (globs may not match) ---
-          WS=""; PROJ=""
-          for f in *.xcworkspace; do [ -e "$f" ] && WS="$f" && break; done
-          for f in *.xcodeproj;   do [ -e "$f" ] && PROJ="$f" && break; done
-          if [ -z "$WS" ] && [ -z "$PROJ" ]; then echo "ERROR: no .xcworkspace or .xcodeproj found in $(pwd)"; return 1; fi
-          if [ -n "$WS" ]; then CONTAINER=(-workspace "$WS"); else CONTAINER=(-project "$PROJ"); fi
-          echo "Container: ${CONTAINER[*]}"
-
-          # --- publish scheme manifest for the list_schemes tool ---
-          LIST_JSON=$(xcodebuild "${CONTAINER[@]}" -list -json 2>/dev/null || echo '{}')
-          echo "$LIST_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin) or {}; k='workspace' if 'workspace' in d else ('project' if 'project' in d else None); s=(d.get(k,{}).get('schemes') if k else []) or []; print(json.dumps({'schemes': s, 'default_scheme': s[0] if s else ''}))" > schemes.json
-          aws s3 cp schemes.json "s3://$ARTIFACTS_BUCKET/schemes/$BRANCH.json" || true
-          [ -z "$SCHEME" ] && SCHEME=$(python3 -c "import json;print(json.load(open('schemes.json'))['default_scheme'])")
-          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme given and none auto-detected (shared schemes: $(python3 -c "import json;print(json.load(open('schemes.json'))['schemes'])" 2>/dev/null))"; return 1; fi
-          echo "Using scheme: $SCHEME"
-
-          # --- resolve a concrete simulator (id beats name; avoids ambiguity) ---
-          DEST_ID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-          if [ -z "$DEST_ID" ]; then
-            echo "Device '$DEVICE' not found; available:"; xcrun simctl list devices available | grep -i iphone
-            DEST_ID=$(xcrun simctl list devices available | grep -iE 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
-          fi
-          [ -z "$DEST_ID" ] && { echo "ERROR: no iPhone simulator available"; return 1; }
-          xcrun simctl boot "$DEST_ID" || true
-
-          # --- warm build state: DerivedData + resolved SPM, per repo ---
-          # Under $REPO_STATE (restored from / saved to S3). No CodeBuild `cache:`:
-          # LOCAL_CUSTOM_CACHE symlinks through a root-owned store the build user
-          # can't write (POSIX 13). CLEAN_BUILD=true forces a cold build via fresh
-          # ephemeral DerivedData, leaving warm state intact.
-          if [ "$CLEAN_BUILD" = "true" ]; then
-            DERIVED="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/DerivedData"
-            SPM_DIR="/tmp/ios-mcp-clean-$CODEBUILD_BUILD_NUMBER/SourcePackages"
-            echo "Clean build requested -> fresh DerivedData at $DERIVED (warm state untouched)"
-          else
-            DERIVED="$REPO_STATE/DerivedData"
-            SPM_DIR="$REPO_STATE/SourcePackages"
-            echo "Warm build -> reusing $DERIVED (incremental when this instance is warm)"
-          fi
-          mkdir -p "$DERIVED" "$SPM_DIR"
-          DERIVED_ARGS=(-derivedDataPath "$DERIVED" -clonedSourcePackagesDirPath "$SPM_DIR")
-
-          # No explicit -resolvePackageDependencies pass: `xcodebuild test` resolves
-          # the package graph itself, so a separate pre-resolve just doubled the
-          # ~100s graph computation. The warm SPM checkouts dir is reused either way.
-          TESTPLAN_ARG=(); [ -n "$TEST_PLAN" ] && TESTPLAN_ARG=(-testPlan "$TEST_PLAN")
-
-          # --- optional whole-session video (RECORD_SESSION=true) ---
-          # OS-level capture of the simulator display, independent of whatever the
-          # XCUITest captures into the xcresult. Recorder runs in the background;
-          # SIGINT (not KILL) lets simctl finalize a playable mp4.
-          REC_PID=""
-          if [ "$RECORD_SESSION" = "true" ]; then
-            echo "Recording session -> session.mp4"
-            xcrun simctl io "$DEST_ID" recordVideo --codec h264 --force "$CODEBUILD_SRC_DIR/session.mp4" &
-            REC_PID=$!
-          fi
-
-          # Sentinel for the post-build compile count (Layer 2 of the save gate +
-          # the compiles_artifacts metric). Touched immediately before xcodebuild,
-          # so any .o/.swiftmodule newer than it was produced by THIS run. Must be a
-          # real file: `find -newer ""` errors and silently yields 0.
-          BUILD_SENTINEL="$REPO_STATE/.build_sentinel"
-          mkdir -p "$REPO_STATE"; : > "$BUILD_SENTINEL"
-
-          echo "=== xcodebuild test ==="
-          mark test_start
-          xcodebuild test \
-            "${CONTAINER[@]}" \
-            -scheme "$SCHEME" \
-            -destination "id=$DEST_ID" \
-            -resultBundlePath "$CODEBUILD_SRC_DIR/TestResults.xcresult" \
-            "${TESTPLAN_ARG[@]}" \
-            "${DERIVED_ARGS[@]}" \
-            -enableCodeCoverage YES
-          RC=${PIPESTATUS[0]}
-          mark test_end
-
-          if [ -n "$REC_PID" ]; then
-            kill -INT "$REC_PID" 2>/dev/null || true
-            wait "$REC_PID" 2>/dev/null || true
-          fi
-
-          # --- save warm state to S3, gated by TWO independent layers ------------
-          # tar+gzip+upload costs ~160-200s; only pay it when it buys something.
-          # Layer 1 (commit SHA): SRC_HASH == stored hash -> source identical -> skip.
-          # Layer 2 (CACHE_SAVE_THRESHOLD): if recompiles < repo's known churn floor,
-          #   it's just that floor -> skip even if Layer 1 disagreed. COMPILES counts
-          #   artifacts newer than the sentinel. Seeding always wins (empty S3 ->
-          #   upload once so siblings can restore). Skipped for clean builds.
-          if [ "$CLEAN_BUILD" != "true" ]; then
-            COMPILES=0
-            for d in "$DERIVED/Build/Intermediates.noindex" "$DERIVED/Build/Products"; do
-              [ -d "$d" ] || continue
-              n=$(find "$d" -type f \( -name '*.o' -o -name '*.swiftmodule' \) -newer "$BUILD_SENTINEL" 2>/dev/null | wc -l | tr -d ' ')
-              COMPILES=$(( COMPILES + n ))
-            done
-
-            SAVE=0; REASON=""
-            if [ "$S3_HAD_CACHE" = "0" ]; then
-              SAVE=1; REASON="seeding empty S3 cache"
-            elif [ "$SRC_HASH" != "$STORED_HASH" ]; then
-              SAVE=1; REASON="source changed"
-            else
-              REASON="source unchanged"
-            fi
-            # Layer 2 veto (never blocks the initial seed)
-            if [ "$SAVE" = "1" ] && [ "$S3_HAD_CACHE" = "1" ] \
-               && [ -n "${CACHE_SAVE_THRESHOLD:-}" ] && [ "$COMPILES" -lt "$CACHE_SAVE_THRESHOLD" ]; then
-              SAVE=0; REASON="below threshold ($COMPILES<$CACHE_SAVE_THRESHOLD)"
-            fi
-
-            CACHE_SAVED=false
-            if [ "$SAVE" = "1" ]; then
-              echo "Saving warm cache -> $S3_CACHE ($REASON; $COMPILES recompiled)"
-              T0=$(date +%s)
-              if tar -c -C "$WARM_ROOT" "$SRC_KEY" 2>/dev/null | gzip -1 2>/dev/null | aws s3 cp - "$S3_CACHE" 2>/dev/null; then
-                printf '%s' "$SRC_HASH" | aws s3 cp - "$S3_HASH" 2>/dev/null || true
-                CACHE_SAVED=true
-                echo "Warm cache saved in $(( $(date +%s) - T0 ))s"
-              else
-                echo "WARNING: warm cache upload failed (non-fatal; next build may be cold)"
-              fi
-            else
-              echo "Skipping warm cache upload ($REASON; $COMPILES recompiled) - no tax on warm path"
-            fi
-            # Expose the decision to the metrics block (written to a file since the
-            # metrics python runs outside this tee'd subshell).
-            printf 'src_hash=%s\ncache_saved=%s\nsave_reason=%s\ncompiles_artifacts=%s\n' \
-              "$SRC_HASH" "$CACHE_SAVED" "$REASON" "$COMPILES" \
-              > "$CODEBUILD_SRC_DIR/cache_decision.txt" 2>/dev/null || true
-          fi
-          mark saved
-          return $RC
-        }
-
-        run 2>&1 | tee "$LOG"
-        TEST_RC=${PIPESTATUS[0]}
-
-        # --- diagnostics: ALWAYS upload the raw log + a focused error tail, so a
-        #     build that fails before tests still surfaces its real error via the
-        #     get_build_log tool / ios_build_status build_errors. ---
-        {
-          echo "=== error / failure lines ===";
-          grep -nE 'error:|fatal error|\*\* (BUILD|TEST|CLEAN) FAILED|xcodebuild: error|Code=|No such|not found|Unable to|Could not|Testing cancelled|Linker command failed' "$LOG" | tail -120;
-          echo; echo "=== last 100 lines ==="; tail -100 "$LOG";
-        } > "$CODEBUILD_SRC_DIR/error_tail.txt" 2>/dev/null || true
-        aws s3 cp "$LOG" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/build_output.log" || true
-        aws s3 cp "$CODEBUILD_SRC_DIR/error_tail.txt" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/error_tail.txt" || true
-
-        # --- artifacts: screenshot + xcresult zip to S3 (best-effort) ---
-        cd "$CODEBUILD_SRC_DIR"
-        [ -n "$DEST_ID" ] && xcrun simctl io "$DEST_ID" screenshot screenshot_final.png || true
-        [ -f screenshot_final.png ] && aws s3 cp screenshot_final.png "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
-        if [ -d TestResults.xcresult ]; then
-          ditto -c -k --sequesterRsrc --keepParent TestResults.xcresult TestResults.xcresult.zip || true
-          aws s3 cp TestResults.xcresult.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/TestResults.xcresult.zip" || true
+        # Fetch and run the build body. Edit tooling/ios-build.sh + `cdk deploy`
+        # to change build behavior (the same deploy updates this stub and the
+        # script, so they cannot skew). The build role can already read the
+        # bucket - the body fetches tooling/xcresult_to_junit.py the same way.
+        SCRIPT="/tmp/ios-build-${CODEBUILD_BUILD_NUMBER:-0}.sh"
+        if ! aws s3 cp "s3://$ARTIFACTS_BUCKET/tooling/ios-build.sh" "$SCRIPT"; then
+          echo "ERROR: could not fetch s3://$ARTIFACTS_BUCKET/tooling/ios-build.sh"
+          echo "       likely causes: runner disk full, or tooling not deployed (cdk deploy)"
+          df -Pk "$HOME" 2>/dev/null || df -Pk / 2>/dev/null || true
+          echo "       see docs/RUNBOOK-runner-disk-full.md"
+          exit 1
         fi
-
-        # --- visual assets: extract whatever the test captured + bundle a
-        #     single downloadable assets.zip (images + session video) ---
-        # The agent can't run xcresulttool/ffmpeg (Linux Lambda), so the Mac does
-        # all extraction here and ships ready-to-view files. assets/ holds:
-        #   - every XCTAttachment image baked into the xcresult (per-test captures)
-        #   - screenshot_final.png (the post-run frame)
-        #   - session.mp4 (only if RECORD_SESSION=true)
-        # Images are ALSO copied to builds/<id>/screenshots/ so the existing
-        # ios_build_status / get_test_logs presigned URLs keep serving them.
-        ASSETS="$CODEBUILD_SRC_DIR/assets"; mkdir -p "$ASSETS"
-        if [ -d TestResults.xcresult ]; then
-          # xcresulttool export attachments dumps every attachment + a manifest;
-          # filenames there are opaque, so rename images by their declared
-          # suggestedHumanReadableName from the manifest for readable evidence.
-          xcrun xcresulttool export attachments \
-            --path TestResults.xcresult \
-            --output-path "$ASSETS/_raw" 2>/dev/null || true
-          python3 - "$ASSETS/_raw" "$ASSETS" <<'PY' || true
-        import json, os, shutil, sys
-        raw, out = sys.argv[1], sys.argv[2]
-        man = os.path.join(raw, "manifest.json")
-        if not os.path.isdir(raw) or not os.path.exists(man):
-            sys.exit(0)
-        data = json.load(open(man))
-        # manifest is a list of test entries, each with an "attachments" list
-        entries = data if isinstance(data, list) else data.get("attachments", [])
-        seen = {}
-        def emit(name, fn):
-            src = os.path.join(raw, fn)
-            if not os.path.isfile(src):
-                return
-            base = name or fn
-            # keep only viewable images; skip plists/logs/etc.
-            if not base.lower().endswith((".png", ".jpg", ".jpeg", ".heic")):
-                if fn.lower().endswith((".png", ".jpg", ".jpeg", ".heic")):
-                    base = base + os.path.splitext(fn)[1]
-                else:
-                    return
-            seen[base] = seen.get(base, 0) + 1
-            if seen[base] > 1:
-                stem, ext = os.path.splitext(base); base = f"{stem}_{seen[base]}{ext}"
-            shutil.copyfile(src, os.path.join(out, base))
-        for e in entries:
-            for a in (e.get("attachments") or []):
-                emit(a.get("suggestedHumanReadableName") or a.get("exportedFileName"),
-                     a.get("exportedFileName"))
-        PY
-          rm -rf "$ASSETS/_raw"
-        fi
-        [ -f screenshot_final.png ] && cp screenshot_final.png "$ASSETS/" || true
-        [ -f session.mp4 ] && cp session.mp4 "$ASSETS/" || true
-        # push extracted images to screenshots/ so presigned-URL tools serve them
-        for img in "$ASSETS"/*.png "$ASSETS"/*.jpg "$ASSETS"/*.jpeg "$ASSETS"/*.heic; do
-          [ -e "$img" ] && aws s3 cp "$img" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/screenshots/" || true
-        done
-        [ -f session.mp4 ] && aws s3 cp session.mp4 "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/session.mp4" || true
-        # single downloadable bundle of all visual evidence
-        if [ -n "$(ls -A "$ASSETS" 2>/dev/null)" ]; then
-          ditto -c -k --sequesterRsrc --keepParent "$ASSETS" assets.zip || true
-          aws s3 cp assets.zip "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/assets.zip" || true
-        fi
-
-        # --- parse results: summary.json (authoritative, read by the Lambda) + JUnit (console) ---
-        if [ -d TestResults.xcresult ]; then
-          aws s3 cp "s3://$ARTIFACTS_BUCKET/tooling/xcresult_to_junit.py" /tmp/conv.py
-          python3 /tmp/conv.py TestResults.xcresult "$CODEBUILD_SRC_DIR/test_results.xml" "$CODEBUILD_SRC_DIR/summary.json" || true
-        fi
-        # summary.json is the contract with ios_build_status — upload even on failure.
-        if [ ! -f "$CODEBUILD_SRC_DIR/summary.json" ]; then
-          # No xcresult (failed before tests). Write a summary that points the
-          # agent at the build log so the failure is never opaque.
-          python3 -c "import json;json.dump({'total':0,'passed':0,'failed':0,'skipped':0,'error':'build failed before tests ran; see build_errors / get_build_log'}, open('$CODEBUILD_SRC_DIR/summary.json','w'))" || echo '{"total":0,"passed":0,"failed":0,"skipped":0}' > "$CODEBUILD_SRC_DIR/summary.json"
-        fi
-        aws s3 cp "$CODEBUILD_SRC_DIR/summary.json" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/summary.json" || true
-        echo "=== summary.json ==="; cat "$CODEBUILD_SRC_DIR/summary.json" || true
-
-        # --- self-reported build metrics: one greppable line + metrics.json in S3
-        # so collect-metrics.py can harvest every run without re-parsing the log.
-        # Phase secs come from phase_times.txt; compile/stale counts + cache state
-        # from the log; test counts from summary.json. All best-effort. SRC_KEY is
-        # recomputed here (it was a run() local) identically to the run() version.
-        METRICS_SRC_KEY=$(printf '%s' "${CODEBUILD_SOURCE_REPO_URL:-default}|$PROJECT_DIR|${COMPUTE_SIZE:-medium}" | tr -c 'A-Za-z0-9._-' '_')
-        python3 - "$LOG" "$PHASES" "$CODEBUILD_SRC_DIR/summary.json" \
-                 "$CODEBUILD_SRC_DIR/metrics.json" "$CODEBUILD_BUILD_ID" "$METRICS_SRC_KEY" \
-                 "$CODEBUILD_SRC_DIR/cache_decision.txt" <<'PY' || true
-        import json, re, sys
-        log, phases_f, summ_f, out, build_id, src_key, cache_f = sys.argv[1:8]
-        def secs(a, b, p):
-            t = {}
-            try:
-                for ln in open(p):
-                    k, _, v = ln.partition(" ")
-                    if v.strip().isdigit(): t[k] = int(v)
-            except Exception: return None
-            return (t[b] - t[a]) if a in t and b in t else None
-        text = open(log, errors="replace").read()
-        compiles = len(re.findall(r'SwiftCompile |CompileSwiftSources', text))
-        # stale = incremental "will remove" / outdated-output purges
-        stale = len(re.findall(r'\bremoved? outdated\b|will remove', text, re.I))
-        restored = "Warm cache restored" in text
-        # cache state heuristic from compile volume (cold ~thousands, warm <~150)
-        state = "cold" if compiles > 800 else ("warm" if compiles < 150 else "partial")
-        try: summ = json.load(open(summ_f))
-        except Exception: summ = {}
-        # Save-gate decision (written by the build phase): hash, saved?, reason.
-        cache = {}
-        try:
-            for ln in open(cache_f):
-                k, _, v = ln.strip().partition("=")
-                if k: cache[k] = v
-        except Exception: pass
-        m = {
-            "build_id": build_id,
-            "repo": src_key,
-            "compiles": compiles,
-            "stale": stale,
-            "cache_restored_from_s3": restored,
-            "cache_state": state,
-            "cache_saved": cache.get("cache_saved") == "true",
-            "save_reason": cache.get("save_reason"),
-            "src_hash": cache.get("src_hash"),
-            "sec_restore": secs("start", "restored", phases_f),
-            "sec_mirror": secs("restored", "mirrored", phases_f),
-            "sec_test": secs("test_start", "test_end", phases_f),
-            "sec_save": secs("test_end", "saved", phases_f),
-            "sec_total": secs("start", "saved", phases_f),
-            "tests_total": summ.get("total"),
-            "tests_passed": summ.get("passed"),
-            "tests_failed": summ.get("failed"),
-            "tests_skipped": summ.get("skipped"),
-            "test_total_ms": (summ.get("timing") or {}).get("test_total_ms"),
-        }
-        json.dump(m, open(out, "w"))
-        print("=== METRICS " + json.dumps(m) + " ===")
-        PY
-        aws s3 cp "$CODEBUILD_SRC_DIR/metrics.json" "s3://$ARTIFACTS_BUCKET/builds/$CODEBUILD_BUILD_ID/metrics.json" || true
-        exit $TEST_RC
+        bash "$SCRIPT"
+        exit $?
 
 reports:
   ios-test-report:
@@ -424,7 +62,7 @@ artifacts:
     - "screenshot_final.png"
   base-directory: "."
 
-# No CodeBuild `cache:` block: warm state is managed by hand in the build phase
+# No CodeBuild `cache:` block: warm state is managed by hand in tooling/ios-build.sh
 # (per-repo+size DerivedData + SPM + stable src under $HOME/ios-mcp-state,
 # round-tripped to S3 warm-cache/<key>.tar.gz). LOCAL_CUSTOM_CACHE symlinks
 # through a root-owned store the build user can't write (POSIX 13); native S3

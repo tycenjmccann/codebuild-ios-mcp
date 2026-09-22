@@ -38,6 +38,23 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
   readonly enableLarge: boolean;
   /** Concurrent build slots on the LARGE fleet (ignored when enableLarge=false). */
   readonly largeBaseCapacity: number;
+  /**
+   * How long a build may sit QUEUED before CodeBuild kills it. CodeBuild's default
+   * is 8 hours, which hides a dead fleet from the agent entirely — the build just
+   * never starts. One reserved Mac serializes builds at ~10-15 min each, so 60 min
+   * is roughly a four-deep real queue; longer than that means no instance is
+   * picking work up. The Lambda's stall preflight catches the genuinely-wedged
+   * fleet far sooner (FLEET_STALL_MINUTES); this is the backstop. Clamped to
+   * CodeBuild's allowed 5-480 min.
+   */
+  readonly queuedTimeoutMinutes: number;
+  /**
+   * How long a build may be QUEUED with NOTHING running on the same fleet before
+   * ios_test treats that fleet as stalled and refuses to enqueue
+   * (INSUFFICIENT_CAPACITY, overridable with force:true). Passed to the Lambda as
+   * FLEET_STALL_MINUTES.
+   */
+  readonly fleetStallMinutes: number;
   /** Days before objects under builds/ expire in the artifacts bucket. */
   readonly artifactRetentionDays: number;
   /** TTL (seconds) for presigned artifact URLs returned by the Lambda. */
@@ -69,6 +86,7 @@ export interface CodebuildIosMcpStackProps extends cdk.StackProps {
  *   - S3 artifacts bucket (private, lifecycle-expired, seeded with the xcresult converter)
  *   - A reserved MAC_ARM CodeBuild fleet (CfnFleet; no L2 construct exists)
  *   - A CodeBuild project that references the fleet and embeds buildspec.yaml inline
+ *     (the stub; the build body ships as tooling/ios-build.sh in the same bucket)
  *   - A python3.12 Lambda hosting the four MCP tools
  *   - An IAM role the AgentCore Gateway assumes to invoke the Lambda
  *
@@ -124,7 +142,9 @@ export class CodebuildIosMcpStack extends cdk.Stack {
       ],
     });
 
-    // The buildspec fetches s3://<bucket>/tooling/xcresult_to_junit.py at runtime.
+    // Ships the whole tooling/ dir: the build fetches s3://<bucket>/tooling/
+    // ios-build.sh (the build body, too big to inline) and xcresult_to_junit.py
+    // at runtime. Same deploy as the buildspec stub, so the two never skew.
     new s3deploy.BucketDeployment(this, 'ToolingDeployment', {
       destinationBucket: artifactsBucket,
       destinationKeyPrefix: 'tooling',
@@ -314,15 +334,34 @@ export class CodebuildIosMcpStack extends cdk.Stack {
     );
 
     // ----------------------------------------------------------------------- //
-    // CodeBuild project. The buildspec.yaml at the repo root is the SINGLE
-    // SOURCE OF TRUTH: it is read at synth time and embedded inline so the
-    // user's iOS repo needs no buildspec file. Edit buildspec.yaml + redeploy
-    // to update build behavior.
+    // CodeBuild project. Build behavior lives in two files, both shipped by this
+    // deploy: buildspec.yaml (stub + env/reports/artifacts) is read at synth time
+    // and embedded inline, and tooling/ios-build.sh (the shell body the stub
+    // fetches from s3://<bucket>/tooling/) goes up with the ToolingDeployment
+    // above. The user's iOS repo still needs no buildspec file.
     // ----------------------------------------------------------------------- //
     const buildspecPath = path.join(__dirname, '..', 'buildspec.yaml');
     const buildspecObject = yaml.load(fs.readFileSync(buildspecPath, 'utf8')) as {
       [key: string]: unknown;
     };
+
+    // CodeBuild rejects an inline buildspec larger than 25600 bytes, and `cdk
+    // synth` does NOT catch it: only `cdk deploy` fails, after the fleet is
+    // already billing. We hit this for real - a4bc8ef had to hand-trim the live
+    // project's inline buildspec to 25550 B to fit. So fail fast here, and keep
+    // the ~31 KB shell body in tooling/ios-build.sh rather than trimming
+    // comments to squeeze back under. toBuildSpec() returns exactly the string
+    // that lands in the template.
+    const INLINE_BUILDSPEC_MAX_BYTES = 25600;
+    const buildSpec = codebuild.BuildSpec.fromObjectToYaml(buildspecObject);
+    const buildSpecBytes = Buffer.byteLength(buildSpec.toBuildSpec(), 'utf8');
+    if (buildSpecBytes > INLINE_BUILDSPEC_MAX_BYTES) {
+      throw new Error(
+        `buildspec.yaml serializes to ${buildSpecBytes} bytes inline, over CodeBuild's ` +
+          `${INLINE_BUILDSPEC_MAX_BYTES}-byte cap (see a4bc8ef). Move shell out of the ` +
+          'build command into tooling/ios-build.sh, which the stub fetches at runtime.',
+      );
+    }
 
     // No CodeBuild cache construct: warm DerivedData + resolved SPM persist in
     // $HOME/ios-mcp-state on the reserved Mac (the instance stays alive between
@@ -337,9 +376,14 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         repo: parseGitHubRepo(props.githubRepo),
         branchOrRef: props.sourceVersion,
       }),
-      buildSpec: codebuild.BuildSpec.fromObjectToYaml(buildspecObject),
+      buildSpec,
       role: codeBuildRole,
       timeout: cdk.Duration.minutes(40),
+      // Cap the QUEUED wait. Without this, CodeBuild's 8h default means a build no
+      // fleet instance can pick up (wedged/disk-full Mac) simply never starts, and
+      // the agent polls IN_PROGRESS forever. Failing it turns that into a
+      // BUILD_ERROR the Lambda labels as a queue timeout. See TEAM-4921.
+      queuedTimeout: cdk.Duration.minutes(props.queuedTimeoutMinutes),
       environment: {
         // The L2 rejects a Mac image at construct time ("Mac images must be used
         // with a fleet") because it can't see the fleet we attach below via
@@ -390,6 +434,9 @@ export class CodebuildIosMcpStack extends cdk.Stack {
         // MEDIUM is the project default; LARGE empty when the large fleet is off.
         FLEET_MEDIUM_ARN: fleet.attrArn,
         FLEET_LARGE_ARN: fleetLarge ? fleetLarge.attrArn : '',
+        // Stall threshold for the ios_test capacity preflight: QUEUED longer than
+        // this with nothing running on the same fleet = wedged instance, not a queue.
+        FLEET_STALL_MINUTES: String(props.fleetStallMinutes),
         // AWS_REGION is reserved/auto-populated by the Lambda runtime.
       },
     });
@@ -409,6 +456,17 @@ export class CodebuildIosMcpStack extends cdk.Stack {
           'codebuild:ListBuildsForProject',
         ],
         resources: [project.projectArn],
+      }),
+    );
+    // Fleet health for the ios_test capacity preflight (refuse to enqueue onto a
+    // non-ACTIVE fleet). Scoped to this stack's fleet ARNs — no `*`. If the action
+    // turns out to be *-only in IAM, this grant fails closed and the preflight's
+    // best-effort path logs and proceeds on the stall check alone.
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadFleetStatus',
+        actions: ['codebuild:BatchGetFleets'],
+        resources: fleetLarge ? [fleet.attrArn, fleetLarge.attrArn] : [fleet.attrArn],
       }),
     );
     // Live log tail (get_build_log while IN_PROGRESS) reads the project's

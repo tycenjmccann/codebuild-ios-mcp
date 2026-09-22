@@ -38,7 +38,8 @@ What `cdk deploy` creates:
 
 - **S3 artifacts bucket** `ios-agent-test-artifacts-<account>` — all public access
   blocked, SSE-S3 encryption, SSL enforced, `builds/` expires after 14 days, and
-  seeded with `tooling/xcresult_to_junit.py` (used by the buildspec to convert
+  seeded with the whole `tooling/` dir: `ios-build.sh` (the build body the
+  buildspec stub fetches and runs) and `xcresult_to_junit.py` (converts
   `.xcresult` to JUnit XML).
 - **MAC_ARM reserved CodeBuild fleet(s)** — Apple M2, image
   `aws/codebuild/macos-arm-base:14`, `baseCapacity` (default 1), overflow `QUEUE`,
@@ -48,7 +49,7 @@ What `cdk deploy` creates:
   (`enableLarge`), and `ios_test(compute_size: "large")` routes a build to it via
   `StartBuild` `fleetOverride` — one project, both sizes, no redeploy.
 - **CodeBuild project** `ios-agent-tests` — GITHUB source (your iOS repo), the
-  buildspec embedded **inline** from `buildspec.yaml`, attached to the fleet,
+  buildspec stub embedded **inline** from `buildspec.yaml`, attached to the fleet,
   40-minute timeout, dedicated CloudWatch log group, auto-creates the
   `ios-agent-tests-ios-test-report` JUNITXML report group on first run.
 - **Lambda** `codebuild-ios-mcp` — the seven MCP tools, least-privilege exec role.
@@ -114,6 +115,8 @@ Defaults live in `cdk.json` under the `context` block; override any of them with
 | `codebuild-ios-mcp:projectDir`           | `.`                                                            | Subdir holding the `.xcworkspace`/`.xcodeproj`     |
 | `codebuild-ios-mcp:defaultDevice`        | `iPhone 17`                                                     | Default simulator device name                      |
 | `codebuild-ios-mcp:baseCapacity`         | `1`                                                            | Always-on reserved Macs = concurrent build slots (each ~$25-30/day; builds beyond it queue) |
+| `codebuild-ios-mcp:queuedTimeoutMinutes` | `60`                                                           | Max minutes a build may sit QUEUED before CodeBuild fails it (backstop for a wedged fleet; clamped 5-480) |
+| `codebuild-ios-mcp:fleetStallMinutes`    | `20`                                                           | QUEUED-with-nothing-running longer than this = `ios_test` treats the fleet as stalled (`INSUFFICIENT_CAPACITY`; `force:true` overrides) |
 | `codebuild-ios-mcp:artifactRetentionDays`| `14`                                                           | Days before `builds/` artifacts expire             |
 | `codebuild-ios-mcp:presignTtlSec`        | `3600`                                                         | TTL (seconds) for presigned artifact URLs          |
 | `codebuild-ios-mcp:vpcId`                | `""` (no VPC)                                                  | VPC to run builds in (reach private Nexus/services) |
@@ -171,20 +174,29 @@ KEEP_GATEWAY=1 TARGET_ID=<target-id> GATEWAY_ID=<gateway-id> ./scripts/deregiste
 The Gateway exposes the seven tools defined in `gateway-tools.json`. The contract
 is async — start a build, then poll:
 
-1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session], [compute_size], [cache_save_threshold])`
+1. `ios_test(branch, scheme, [device], [os_version], [test_plan], [repo], [project_dir], [clean_build], [record_session], [compute_size], [cache_save_threshold], [force])`
    → returns `{ status: "IN_PROGRESS", build_id, repo, project_dir, branch, compute_size }`
    immediately (the resolved `repo`/`project_dir`/`branch` are echoed back so a
    wrong default is obvious). `repo`/`project_dir` point the shared project at
    another app for this run; `clean_build: true` forces a cold build (warm state
    untouched); `record_session: true` records the whole simulator display to a
    `session.mp4`; `compute_size: "large"` routes this run to the large (Apple M2,
-   12 vCPU/32 GB) fleet instead of medium.
+   12 vCPU/32 GB) fleet instead of medium. `branch` must be a branch/tag name or a
+   **full 40-hex commit SHA** — an abbreviated SHA is refused up front with
+   `reason: "SHORT_SHA"` (CodeBuild's checkout can't fetch one). Before starting,
+   the tool also refuses with `reason: "INSUFFICIENT_CAPACITY"` if the target
+   fleet is not `ACTIVE` or looks stalled (builds `QUEUED`, nothing running, past
+   `fleetStallMinutes`) — the response names the stalled build ids and a
+   remediation; pass `force: true` to enqueue anyway.
 2. Poll `ios_build_status(build_id)` until `status != "IN_PROGRESS"`.
    - `SUCCEEDED` — all tests passed.
    - `FAILED` — tests ran and some failed (`test_summary`, `failures[]`).
-   - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`).
+   - `BUILD_ERROR` — compile/build failed before tests ran (`test_summary.total == 0`),
+     including a build no fleet instance ever picked up (`build_errors[0]` names the
+     QUEUED timeout — an infrastructure fault, not a test/compile failure).
    - `TIMED_OUT` — build exceeded the 40-minute limit.
-   - Every response carries `compute_size` (where it ran) and a `phases[]` timeline
+   - Every response carries `compute_size` (where it ran), `queued_seconds` (how
+     long it waited/waits for a fleet instance), and a `phases[]` timeline
      (DOWNLOAD_SOURCE → INSTALL → BUILD → … each with status + `duration_seconds`),
      so the agent can see *where* a slow build is and which phase failed — even
      while `IN_PROGRESS`.
@@ -197,7 +209,7 @@ is async — start a build, then poll:
      video if recorded), `artifacts.session_video_url` (present only when
      `record_session` was set), `artifacts.build_log_url`, and a
      `artifacts.logs_url` CloudWatch link.
-3. `list_schemes(branch)` — schemes the buildspec published for that branch
+3. `list_schemes(branch)` — schemes the build published for that branch
    (written to `schemes/<branch>.json` on each run).
 4. `get_test_logs(build_id, test_name)` — class name, message, duration, and
    failure screenshots for one failed test.
@@ -209,9 +221,12 @@ is async — start a build, then poll:
    `ios_build_status` returns `BUILD_ERROR` or `test_summary.total == 0` —
    `get_test_logs` can't help there because there are no named tests.
 6. `ios_list_builds([limit], [compute_size])` — recent builds with status, phase,
-   size, and timing, plus running/queued counts. CodeBuild has no per-build
-   "which instance" view, so this is how an agent driving several builds sees
-   queue depth on each fleet instead of polling build ids blind.
+   size, timing, and `queued_seconds`, plus running/queued counts and a `fleets`
+   object keyed by size (`running`, `queued`, `oldest_queued_seconds`, `stalled`,
+   `queued_build_ids`, `fleet_status`). CodeBuild has no per-build "which
+   instance" view, so this is how an agent driving several builds sees queue
+   depth — and whether a fleet is actually wedged (`stalled: true`) — instead of
+   polling build ids blind.
 7. `ios_cancel(build_id)` — stop a wrong or runaway build (`StopBuild`) and free
    the macOS fleet instead of waiting out the 40-minute timeout.
 
@@ -312,10 +327,11 @@ For interactive testing, point the
    `codebuild-ios-mcp:projectDir` to the subdir holding the
    `.xcworkspace`/`.xcodeproj`.
 2. For private repos, import a GitHub source credential (see Prerequisites).
-3. `cdk deploy`. Your repo needs **no buildspec file** — it is embedded in the
-   project from this repo's `buildspec.yaml`.
+3. `cdk deploy`. Your repo needs **no buildspec file** — the stub is embedded in
+   the project from this repo's `buildspec.yaml` and the build body is deployed to
+   `s3://<bucket>/tooling/ios-build.sh`.
 
-The buildspec auto-detects the workspace/project, resolves a concrete simulator
+The build auto-detects the workspace/project, resolves a concrete simulator
 by device id, runs `xcodebuild test`, uploads a screenshot and
 `TestResults.xcresult.zip` to S3 under `builds/$CODEBUILD_BUILD_ID/`, and parses
 the xcresult into `builds/$CODEBUILD_BUILD_ID/summary.json` — the authoritative
@@ -325,7 +341,7 @@ source for the structured `test_summary` / `failures` the tools return.
 
 An agent can't run `xcresulttool`/`ffmpeg` (those are macOS-only; the Lambda is
 Linux), so the Mac does all extraction during the build and ships ready-to-view
-files. After tests run, the buildspec:
+files. After tests run, the build script:
 
 - **Extracts every image the test captured.** `xcresulttool export attachments`
   pulls each `XCTAttachment` out of the `.xcresult`, renamed to its
@@ -338,7 +354,7 @@ files. After tests run, the buildspec:
   `builds/<id>/screenshots/`, so `artifacts.screenshots[]` and
   `get_test_logs(...).screenshots[]` keep serving them as presigned URLs.
 - **Optionally records the whole session.** Pass `record_session: true` to
-  `ios_test` and the buildspec records the entire simulator display to
+  `ios_test` and the build script records the entire simulator display to
   `session.mp4` (OS-level `simctl recordVideo`, independent of anything the test
   captures). Returned as `artifacts.session_video_url` and included in the zip.
   Off by default; reach for it when the test captures nothing of its own.
@@ -386,7 +402,7 @@ same seven MCP tools work whether or not the fleet is in a VPC.
 
 **Builds are incremental by default — no flag, no cache config.** Reserved
 capacity fleets keep the Mac instance alive between builds (only the source dir
-is re-cloned each run), so the buildspec simply points Xcode at a stable
+is re-cloned each run), so the build script simply points Xcode at a stable
 `$HOME/ios-mcp-state` directory the build user owns. The first build of an app is
 cold; every build after that lands on the warm instance and reuses DerivedData +
 resolved SPM, so re-tests finish in a fraction of the time. That is the whole
@@ -408,6 +424,23 @@ Need a guaranteed cold build for one run? Pass **`clean_build: true`** to
 `ios_test` — it compiles into a fresh throwaway DerivedData for that run and
 leaves the warm state intact for the next. No redeploy.
 
+**Disk guard.** The reserved Mac's disk is the one thing that persists
+between builds, and it is finite: warm state, the SwiftPM cache, and scratch
+dirs from `clean_build` runs all accumulate. Every build now measures free
+disk on `$HOME` up front, reclaims in cheapest-first tiers (throwaway scratch
+→ SwiftPM/Xcode caches → least-recently-built warm state) if it's under
+threshold, and — if that still isn't enough — fails in seconds with a
+distinctive `runner disk full` error instead of ENOSPCing opaquely for
+minutes. A run that hit ENOSPC or produced no test result bundle never
+publishes its state as the warm cache, so a broken run can't poison the next
+one — and if an already-poisoned cache is restored (no `DerivedData/Build` in the
+tar), its `SourcePackages`/`DerivedData` are discarded before the build, because
+half-written SPM bare repos make `xcodebuild` fail outright rather than just
+compile cold. `metrics.disk_free_gb_start`/`disk_free_gb_end`/`disk_reclaimed_gb` on
+`ios_build_status` show the headroom trend. See
+[`docs/RUNBOOK-runner-disk-full.md`](docs/RUNBOOK-runner-disk-full.md) if you
+hit this.
+
 ### Many apps on one stack
 
 The fleet is the only standing cost — **always run one shared fleet**, never one
@@ -423,14 +456,33 @@ per app. Two ways to serve multiple apps on it:
 
 Either way the Gateway, Lambda, and tools are unchanged.
 
-### The buildspec is the single source of truth
+### Build behavior: `buildspec.yaml` (stub + env) + `tooling/ios-build.sh` (body)
 
 `buildspec.yaml` at the repo root is read at synth time and embedded inline into
-the CodeBuild project. To change build behavior, edit that **one file** and
-`cdk deploy` again — there is no buildspec to maintain in the iOS repo. The
-`ios_test` env overrides (`SCHEME`, `DEVICE`, `OS_VERSION`, `TEST_PLAN`) and the
+the CodeBuild project, but it holds only the environment (`env.variables`,
+`reports`, `artifacts`) and a ~15-line stub: fetch
+`s3://$ARTIFACTS_BUCKET/tooling/ios-build.sh`, `bash` it, propagate its exit code.
+All the actual build logic lives in `tooling/ios-build.sh`.
+
+Why split: CodeBuild caps an **inline buildspec at 25,600 bytes**, and `cdk synth`
+does not catch it — only `cdk deploy` fails. We hit the cap for real, and the fix
+then had to be hand-trimmed into the live project to fit. The body is ~31 KB, so it
+ships as a file instead, and the stack now **throws at synth** if the serialized
+buildspec exceeds 25,600 B.
+
+Both halves ship in the **same `cdk deploy`**: the stub via the project, the script
+via the `tooling/` BucketDeployment — so they cannot skew. Consequences worth
+knowing: changing build behavior still requires a deploy (the script is not "live
+editable"); don't hand-edit the S3 object, the next deploy overwrites it; and a
+build already running when a deploy lands keeps the copy it downloaded at phase
+start. If the fetch itself fails, the build stops immediately with
+`ERROR: could not fetch …/tooling/ios-build.sh` plus a `df` dump — the two causes
+are a disk-full runner and tooling that was never deployed.
+
+The `ios_test` env overrides (`SCHEME`, `DEVICE`, `OS_VERSION`, `TEST_PLAN`) and the
 project env (`ARTIFACTS_BUCKET`, `PROJECT_DIR`) are the contract between the
-Lambda and the buildspec — keep them in sync if you change either side.
+Lambda and the build script (which inherits them as a child process) — keep them in
+sync if you change either side.
 
 ---
 
@@ -470,8 +522,10 @@ aws codebuild delete-fleet --arn <FleetArn-from-outputs>
 ├── lib/codebuild-ios-mcp-stack.ts   the stack (bucket, fleet, project, Lambda, gateway role, outputs)
 ├── lambda/handler.py                the seven MCP tools (Gateway lambda target + direct test path)
 ├── tooling/xcresult_to_junit.py     xcresult -> JUnit converter, uploaded to s3://<bucket>/tooling/
-├── buildspec.yaml                   embedded inline into the CodeBuild project (single source of truth)
+├── tooling/ios-build.sh             the build body, uploaded to s3://<bucket>/tooling/ and run by the stub
+├── buildspec.yaml                   embedded inline into the CodeBuild project (stub + env/reports/artifacts)
 ├── gateway-tools.json               inline tool schema for the Gateway lambda target
+├── docs/RUNBOOK-runner-disk-full.md runner disk-full / stalled-fleet operator steps
 ├── examples/connect_agent.py        SigV4 MCP client — connect an agent to the gateway
 ├── scripts/register-gateway.sh      one-time: create gateway + lambda target from stack outputs
 ├── scripts/deregister-gateway.sh    delete target(s) + gateway
